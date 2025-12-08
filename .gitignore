@@ -5,6 +5,7 @@
 *.so
 *.dylib
 /bot
+/emailbot
 
 # Data and secrets
 .env
