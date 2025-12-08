@@ -108,34 +108,72 @@ func (b *Bot) handleStart(ctx context.Context, tgBot *bot.Bot, update *models.Up
 func (b *Bot) handleHelp(ctx context.Context, tgBot *bot.Bot, update *models.Update) {
 	msg := update.Message
 
+	// Check if it's a private chat
+	if msg.Chat.Type == "private" {
+		text := `<b>Email to Telegram Bot</b>
+
+Бот для пересылки email сообщений в Telegram.
+
+<b>Как использовать:</b>
+1. Создайте супергруппу
+2. Включите топики в настройках группы
+3. Добавьте бота в группу
+4. Сделайте бота администратором
+5. В нужном топике используйте /connect
+
+<b>Почему нужны топики?</b>
+Каждый email-аккаунт привязывается к отдельному топику. Это позволяет удобно разделять письма от разных аккаунтов.
+
+<b>Как включить топики:</b>
+Настройки группы → Темы → Включить`
+
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, text)
+		return
+	}
+
+	// Check if it's a group without topics
+	if msg.Chat.Type == "group" || (msg.Chat.Type == "supergroup" && !msg.Chat.IsForum) {
+		text := `<b>Требуются топики!</b>
+
+Этот бот работает только в супергруппах с включёнными топиками.
+
+<b>Как включить:</b>
+1. Откройте настройки группы
+2. Найдите раздел "Темы" (Topics)
+3. Включите топики
+
+После этого каждый email можно будет привязать к отдельному топику.`
+
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, text)
+		return
+	}
+
+	// Normal help for supergroups with topics
 	text := `<b>Email to Telegram Bot</b>
 
-Бот для пересылки email сообщений в Telegram топики.
+Пересылка email сообщений в этот топик.
 
 <b>Команды:</b>
-/connect email password - подключить существующую почту
-/disconnect - отключить почту от топика
-/status - показать статус подключений`
+/connect email password — подключить почту
+/disconnect — отключить почту
+/status — статус подключений`
 
 	// Add /create command info if Mailcow is configured
 	if b.mailcow != nil && b.mailcow.IsConfigured() {
 		text += fmt.Sprintf(`
-
-<b>Mailcow:</b>
-/create username - создать новый ящик на %s`, b.mailcow.GetDomain())
+/create username — создать ящик на %s`, b.mailcow.GetDomain())
 	}
 
 	text += `
 
 <b>Примеры:</b>
-<code>/connect myemail@gmail.com mypassword</code>
-<code>/connect myemail@mail.ru password imap.mail.ru:993</code>
+<code>/connect user@gmail.com app_password</code>
+<code>/connect user@mail.ru pass imap.mail.ru:993</code>
 
 <b>Важно:</b>
-- Используйте в супергруппе с топиками
-- Только администраторы могут управлять почтами
-- Для Gmail используйте пароль приложения
-- IMAP сервер определяется автоматически`
+• Только администраторы могут управлять почтами
+• Для Gmail/Yandex нужен пароль приложения
+• IMAP сервер определяется автоматически`
 
 	b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, text)
 }

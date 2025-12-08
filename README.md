@@ -6,54 +6,39 @@
 
 ## English
 
-Telegram bot that automatically forwards email messages to supergroup topics.
+Telegram bot that forwards emails to supergroup topics in real-time.
 
 ### Features
 
-- **Email Forwarding** — new emails appear instantly in Telegram
-- **Auto-detect OTP Codes** — verification codes are highlighted and can be copied with one click
-- **IMAP IDLE** — real-time notifications for new emails
-- **Auto-detect IMAP Server** — no need to specify server for popular providers
+- **Instant Notifications** — emails appear in Telegram within seconds (IMAP IDLE)
+- **OTP Auto-detection** — verification codes are highlighted with copy button
+- **Smart IMAP Detection** — no need to specify server for Gmail, Outlook, Yahoo, etc.
 - **Mailcow Integration** — create mailboxes directly from Telegram (optional)
-- **Multi-account** — different emails in different topics of the same group
+- **Multi-account** — each topic can have its own email account
+- **Secure** — passwords encrypted with AES-256-GCM
+
+---
 
 ### Quick Start
 
-#### Option 1: Build from source
+#### Step 1: Get Bot Token
+
+1. Open [@BotFather](https://t.me/BotFather) in Telegram
+2. Send `/newbot` and follow instructions
+3. Copy the token
+
+#### Step 2: Clone & Configure
 
 ```bash
-git clone https://github.com/mixelka/emailresend.git
-cd emailresend
-make build
-```
-
-#### Option 2: Docker
-
-```bash
-git clone https://github.com/mixelka/emailresend.git
-cd emailresend
-cp .env.example .env
-# Edit .env with your settings
-make docker-run
-```
-
-### Configuration
-
-```bash
+git clone https://github.com/mixelka75/tgEmailResend.git
+cd tgEmailResend
 cp .env.example .env
 ```
 
-Edit `.env` file:
-
+Edit `.env`:
 ```env
-# Required
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...    # from @BotFather
-ENCRYPTION_KEY=your-32-character-key!!  # exactly 32 characters
-
-# Optional: Mailcow integration
-MAILCOW_URL=https://mail.example.com
-MAILCOW_API_KEY=your-api-key
-MAILCOW_DOMAIN=example.com
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+ENCRYPTION_KEY=your-32-character-key!!
 ```
 
 Generate encryption key:
@@ -61,183 +46,317 @@ Generate encryption key:
 make generate-key
 ```
 
+#### Step 3: Run
+
+**Option A: Direct**
+```bash
+make build
+./emailbot
+```
+
+**Option B: Docker**
+```bash
+make docker-run
+```
+
+---
+
+### Make Commands
+
+| Command | Description |
+|---------|-------------|
+| `make help` | Show all available commands |
+| `make build` | Build the binary |
+| `make run` | Run without building |
+| `make clean` | Remove binary and database |
+| `make deps` | Download dependencies |
+| `make docker` | Build Docker image |
+| `make docker-run` | Start with Docker Compose |
+| `make docker-stop` | Stop Docker Compose |
+| `make generate-key` | Generate 32-char encryption key |
+| `make test` | Run tests |
+| `make lint` | Run linter |
+
+---
+
+### Setup Telegram Group
+
+1. **Create Supergroup**
+   - Create a new group in Telegram
+   - Convert to supergroup (happens automatically when you add topics)
+
+2. **Enable Topics**
+   - Open group settings
+   - Find "Topics" section
+   - Enable topics
+
+3. **Add Bot**
+   - Add your bot to the group
+   - Make it administrator (needed to delete messages with passwords)
+
+4. **Connect Email**
+   - Go to any topic
+   - Send: `/connect your@email.com password`
+
+---
+
 ### Bot Commands
 
 | Command | Description |
 |---------|-------------|
-| `/connect email password` | Connect email to topic |
-| `/connect email password imap.server:993` | Connect with custom IMAP server |
-| `/create username` | Create new mailbox (Mailcow only) |
+| `/connect email password` | Connect email to current topic |
+| `/connect email password server:993` | Connect with custom IMAP server |
+| `/create username` | Create new mailbox (Mailcow) |
 | `/disconnect` | Disconnect email from topic |
-| `/status` | Show all connections status |
+| `/status` | Show all connections |
 | `/help` | Show help |
 
-### Usage
+---
 
-1. Create a supergroup with topics enabled
-2. Add the bot to the group
-3. Make the bot an administrator (to delete messages with passwords)
-4. In a topic, run:
+### Configuration
 
-```
-/connect myemail@gmail.com app_password
-```
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Yes | — | Bot token from @BotFather |
+| `ENCRYPTION_KEY` | Yes | — | 32-character encryption key |
+| `DATABASE_PATH` | No | `./data/emailbot.db` | SQLite database path |
+| `LOG_LEVEL` | No | `info` | debug, info, warn, error |
+| `LOG_FORMAT` | No | `text` | text (colored) or json |
+| `IMAP_IDLE_TIMEOUT` | No | `25m` | IMAP IDLE timeout |
 
-The IMAP server is detected automatically. For custom servers:
+#### Mailcow Integration (Optional)
 
-```
-/connect myemail@custom.com password imap.custom.com:993
-```
+| Variable | Description |
+|----------|-------------|
+| `MAILCOW_URL` | Mailcow server URL |
+| `MAILCOW_API_KEY` | API key from Mailcow admin |
+| `MAILCOW_DOMAIN` | Domain for new mailboxes |
+
+---
 
 ### Supported Email Providers
 
-IMAP server is auto-detected for:
+Auto-detected IMAP servers:
 - Gmail, Google Workspace
-- Outlook, Hotmail, Live
+- Outlook, Hotmail, Live, Office365
 - Yahoo Mail
 - Yandex, Mail.ru
 - iCloud
 - Proton Mail (via Bridge)
-- And others via MX records
+- Zoho, FastMail, GMX
+- Custom domains (via MX lookup)
 
-### Requirements
+---
 
-- Go 1.22+ (for building)
-- Docker (optional)
-- Telegram supergroup with topics enabled
+### Gmail Setup
 
-### Project Structure
+1. Enable 2FA in Google Account
+2. Go to Security → App passwords
+3. Create new app password
+4. Use this password with `/connect`
 
+### Yandex Setup
+
+1. Go to Yandex ID → Security
+2. Create app password for mail
+3. Use this password with `/connect`
+
+---
+
+### Docker Compose
+
+```yaml
+services:
+  emailbot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
 ```
-emailresend/
-├── cmd/bot/              # Entry point
-├── internal/
-│   ├── config/           # Configuration
-│   ├── database/         # SQLite
-│   ├── email/            # IMAP client
-│   ├── mailcow/          # Mailcow API (optional)
-│   ├── parser/           # Email parsing
-│   ├── formatter/        # Telegram formatting
-│   └── telegram/         # Telegram bot
-├── pkg/models/           # Data models
-└── data/                 # Database storage
-```
 
-### Security
-
-- Passwords are encrypted with AES-256-GCM before storage
-- Commands with passwords are deleted immediately after processing
-- Only group administrators can manage email accounts
+Run: `make docker-run`
+Stop: `make docker-stop`
+Logs: `docker compose logs -f`
 
 ---
 
 ## Русский
 
-Telegram бот для автоматической пересылки email сообщений в топики супергрупп.
+Telegram бот для пересылки email в топики супергрупп в реальном времени.
 
 ### Возможности
 
-- **Пересылка писем** — новые письма автоматически появляются в Telegram
-- **Автодетект кодов** — коды подтверждения (OTP) выделяются и копируются в один клик
-- **IMAP IDLE** — мгновенные уведомления о новых письмах
-- **Автоопределение сервера** — не нужно указывать IMAP сервер для популярных провайдеров
-- **Mailcow интеграция** — создание почтовых ящиков прямо из Telegram (опционально)
-- **Мультиаккаунт** — разные почты в разных топиках одной группы
+- **Мгновенные уведомления** — письма появляются за секунды (IMAP IDLE)
+- **Автодетект OTP** — коды подтверждения выделяются с кнопкой копирования
+- **Умное определение IMAP** — не нужно указывать сервер для Gmail, Outlook, Yahoo
+- **Mailcow интеграция** — создание ящиков прямо из Telegram (опционально)
+- **Мультиаккаунт** — каждый топик может иметь свой email
+- **Безопасность** — пароли шифруются AES-256-GCM
+
+---
 
 ### Быстрый старт
 
-#### Вариант 1: Сборка из исходников
+#### Шаг 1: Получите токен бота
+
+1. Откройте [@BotFather](https://t.me/BotFather) в Telegram
+2. Отправьте `/newbot` и следуйте инструкциям
+3. Скопируйте токен
+
+#### Шаг 2: Клонируйте и настройте
 
 ```bash
-git clone https://github.com/mixelka/emailresend.git
-cd emailresend
-make build
-```
-
-#### Вариант 2: Docker
-
-```bash
-git clone https://github.com/mixelka/emailresend.git
-cd emailresend
-cp .env.example .env
-# Отредактируйте .env
-make docker-run
-```
-
-### Настройка
-
-```bash
+git clone https://github.com/mixelka75/tgEmailResend.git
+cd tgEmailResend
 cp .env.example .env
 ```
 
-Заполните `.env`:
-
+Отредактируйте `.env`:
 ```env
-# Обязательные
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...    # от @BotFather
-ENCRYPTION_KEY=your-32-character-key!!  # ровно 32 символа
-
-# Опционально: интеграция с Mailcow
-MAILCOW_URL=https://mail.example.com
-MAILCOW_API_KEY=your-api-key
-MAILCOW_DOMAIN=example.com
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+ENCRYPTION_KEY=your-32-character-key!!
 ```
 
-Сгенерировать ключ шифрования:
+Сгенерируйте ключ шифрования:
 ```bash
 make generate-key
 ```
+
+#### Шаг 3: Запустите
+
+**Вариант A: Напрямую**
+```bash
+make build
+./emailbot
+```
+
+**Вариант B: Docker**
+```bash
+make docker-run
+```
+
+---
+
+### Команды Make
+
+| Команда | Описание |
+|---------|----------|
+| `make help` | Показать все команды |
+| `make build` | Собрать бинарник |
+| `make run` | Запустить без сборки |
+| `make clean` | Удалить бинарник и БД |
+| `make deps` | Скачать зависимости |
+| `make docker` | Собрать Docker образ |
+| `make docker-run` | Запустить через Docker Compose |
+| `make docker-stop` | Остановить Docker Compose |
+| `make generate-key` | Сгенерировать ключ шифрования |
+| `make test` | Запустить тесты |
+| `make lint` | Запустить линтер |
+
+---
+
+### Настройка группы Telegram
+
+1. **Создайте супергруппу**
+   - Создайте новую группу в Telegram
+   - Она автоматически станет супергруппой при включении топиков
+
+2. **Включите топики**
+   - Откройте настройки группы
+   - Найдите раздел "Темы" (Topics)
+   - Включите топики
+
+3. **Добавьте бота**
+   - Добавьте бота в группу
+   - Сделайте его администратором (нужно для удаления сообщений с паролями)
+
+4. **Подключите почту**
+   - Перейдите в любой топик
+   - Отправьте: `/connect ваша@почта.com пароль`
+
+---
 
 ### Команды бота
 
 | Команда | Описание |
 |---------|----------|
 | `/connect email password` | Подключить почту к топику |
-| `/connect email password imap.server:993` | Подключить с указанием сервера |
-| `/create username` | Создать новый ящик (только Mailcow) |
-| `/disconnect` | Отключить почту от топика |
-| `/status` | Статус всех подключений |
+| `/connect email password server:993` | С указанием IMAP сервера |
+| `/create username` | Создать ящик (Mailcow) |
+| `/disconnect` | Отключить почту |
+| `/status` | Статус подключений |
 | `/help` | Справка |
 
-### Использование
+---
 
-1. Создайте супергруппу с включёнными топиками
-2. Добавьте бота в группу
-3. Сделайте бота администратором (для удаления сообщений с паролями)
-4. В нужном топике напишите:
+### Конфигурация
 
-```
-/connect myemail@gmail.com app_password
-```
+| Переменная | Обязательно | По умолчанию | Описание |
+|------------|-------------|--------------|----------|
+| `TELEGRAM_BOT_TOKEN` | Да | — | Токен от @BotFather |
+| `ENCRYPTION_KEY` | Да | — | Ключ шифрования (32 символа) |
+| `DATABASE_PATH` | Нет | `./data/emailbot.db` | Путь к SQLite |
+| `LOG_LEVEL` | Нет | `info` | debug, info, warn, error |
+| `LOG_FORMAT` | Нет | `text` | text (цветной) или json |
+| `IMAP_IDLE_TIMEOUT` | Нет | `25m` | Таймаут IMAP IDLE |
 
-IMAP сервер определится автоматически. Для нестандартных серверов:
+#### Интеграция Mailcow (опционально)
 
-```
-/connect myemail@custom.com password imap.custom.com:993
-```
+| Переменная | Описание |
+|------------|----------|
+| `MAILCOW_URL` | URL сервера Mailcow |
+| `MAILCOW_API_KEY` | API ключ из админки Mailcow |
+| `MAILCOW_DOMAIN` | Домен для новых ящиков |
+
+---
 
 ### Поддерживаемые провайдеры
 
-IMAP сервер определяется автоматически для:
+Автоопределение IMAP для:
 - Gmail, Google Workspace
-- Outlook, Hotmail, Live
+- Outlook, Hotmail, Live, Office365
 - Yahoo Mail
 - Yandex, Mail.ru
 - iCloud
 - Proton Mail (через Bridge)
-- И другие через MX записи
+- Zoho, FastMail, GMX
+- Свои домены (через MX lookup)
 
-### Требования
+---
 
-- Go 1.22+ (для сборки)
-- Docker (опционально)
-- Супергруппа Telegram с включёнными топиками
+### Настройка Gmail
 
-### Безопасность
+1. Включите 2FA в аккаунте Google
+2. Перейдите в Безопасность → Пароли приложений
+3. Создайте новый пароль приложения
+4. Используйте этот пароль в `/connect`
 
-- Пароли шифруются AES-256-GCM перед сохранением
-- Команды с паролями удаляются сразу после получения
-- Только администраторы группы могут управлять почтами
+### Настройка Яндекс
+
+1. Откройте Яндекс ID → Безопасность
+2. Создайте пароль приложения для почты
+3. Используйте этот пароль в `/connect`
+
+---
+
+### Docker Compose
+
+```yaml
+services:
+  emailbot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+```
+
+Запуск: `make docker-run`
+Остановка: `make docker-stop`
+Логи: `docker compose logs -f`
 
 ---
 
