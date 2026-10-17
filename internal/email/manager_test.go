@@ -299,3 +299,32 @@ func TestDecryptErrorStopsAccount(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 }
+
+func TestEmptyMailboxKeepsMailArrivedWhileDisconnected(t *testing.T) {
+	addr, be, ln, clientTLS := startIMAPServer(t)
+
+	// Empty INBOX: the baseline is UID 0
+	user, _ := be.Login(nil, "username", "password")
+	inbox, _ := user.GetMailbox("INBOX")
+	inbox.(*memory.Mailbox).Messages = nil
+
+	m := newTestManager(t, clientTLS)
+	received := make(chan *RawEmail, 4)
+	synced := make(chan uint32, 4)
+	m.SetMessageHandler(func(_ int64, msg *RawEmail) error { received <- msg; return nil })
+	m.SetSyncHandler(func(_ int64, uid, _ uint32) { synced <- uid })
+	account := &models.EmailAccount{ID: 1, Email: "username", Password: "password", IMAPServer: addr}
+	m.AddAccount(context.Background(), account)
+	defer m.StopAll()
+
+	if uid := waitFor(t, synced, "baseline"); uid != 0 {
+		t.Fatalf("baseline = %d, want 0", uid)
+	}
+
+	// Mail arrives right as the connection drops
+	ln.dropAll()
+	appendMessage(t, be, "While disconnected", "hi")
+	if msg := waitFor(t, received, "message after reconnect"); msg.Subject != "While disconnected" {
+		t.Fatalf("got %q", msg.Subject)
+	}
+}

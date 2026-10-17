@@ -261,7 +261,8 @@ func (m *Manager) syncBaseline(c *Client, mbox *imap.MailboxStatus, account *mod
 
 	reset := ""
 	switch {
-	case account.LastUID == 0:
+	case account.LastUID == 0 && account.UIDValidity == 0:
+		// UIDValidity != 0 means the baseline was set on an empty mailbox
 		reset = "new account"
 	case account.UIDValidity != 0 && validity != 0 && validity != account.UIDValidity:
 		reset = "UIDVALIDITY changed"
