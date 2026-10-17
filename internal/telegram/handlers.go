@@ -14,6 +14,7 @@ import (
 	"github.com/mixelka/emailresend/internal/database"
 	"github.com/mixelka/emailresend/internal/email"
 	"github.com/mixelka/emailresend/internal/formatter"
+	"github.com/mixelka/emailresend/internal/mailcow"
 	appmodels "github.com/mixelka/emailresend/pkg/models"
 )
 
@@ -40,9 +41,7 @@ func (b *Bot) handleConnect(ctx context.Context, tgBot *bot.Bot, update *models.
 	topicID := msg.MessageThreadID
 
 	// Delete the message with password immediately
-	if err := b.deleteMessage(ctx, msg.Chat.ID, msg.ID); err != nil {
-		b.logger.Warn("failed to delete connect message", "error", err)
-	}
+	b.deletePasswordMessage(ctx, msg)
 
 	if email.GetDomainFromEmail(emailAddr) == "" {
 		b.sendMessage(ctx, msg.Chat.ID, topicID, "Некорректный email: "+escape(emailAddr))
@@ -167,6 +166,10 @@ func (b *Bot) handleCreate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	}
 
 	localPart := strings.ToLower(parts[1])
+	if err := mailcow.ValidateLocalPart(localPart); err != nil {
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, escape(err.Error()))
+		return
+	}
 	password := ""
 	name := localPart
 
@@ -181,9 +184,7 @@ func (b *Bot) handleCreate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	// Delete the message with password immediately (if password was provided)
 	if len(parts) >= 3 {
-		if err := b.deleteMessage(ctx, msg.Chat.ID, msg.ID); err != nil {
-			b.logger.Warn("failed to delete create message", "error", err)
-		}
+		b.deletePasswordMessage(ctx, msg)
 	}
 
 	// Check if topic already has an account
@@ -202,17 +203,21 @@ func (b *Bot) handleCreate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	status := newStatusMessage(ctx, b, msg.Chat.ID, topicID)
 	status.set("Создаю почтовый ящик...")
 
-	mailbox, err := b.mailcow.CreateMailbox(ctx, localPart, name, password, 1024)
+	mailbox, err := b.mailcow.CreateMailbox(ctx, localPart, name, password)
 	if err != nil {
 		b.logger.Error("failed to create mailbox", "error", err)
 		status.set(fmt.Sprintf("Ошибка создания почтового ящика: %s", escape(err.Error())))
 		return
 	}
 
-	emailAddr := mailbox.LocalPart + "@" + mailbox.Domain
+	emailAddr := mailbox.Email()
 	imapServer := b.mailcow.GetIMAPServer()
 
 	if b.saveAndStartAccount(ctx, status, emailAddr, mailbox.Password, imapServer, msg) == nil {
+		// Do not leave an orphaned mailbox behind
+		if err := b.mailcow.DeleteMailbox(ctx, emailAddr); err != nil {
+			b.logger.Error("failed to delete mailbox after error", "email", emailAddr, "error", err)
+		}
 		return
 	}
 
@@ -318,126 +323,156 @@ func (b *Bot) handleCallback(ctx context.Context, tgBot *bot.Bot, update *models
 
 	data, err := formatter.DecodeCallback(callback.Data)
 	if err != nil {
-		b.logger.Error("failed to decode callback", "error", err, "data", callback.Data)
-		b.answerCallback(ctx, callback.ID, "Ошибка", false)
+		b.logger.Warn("failed to decode callback", "error", err, "data", callback.Data)
+		b.answerCallback(ctx, callback.ID, "Кнопка устарела", false)
+		return
+	}
+
+	if data.Action == appmodels.CallbackCopyCode {
+		b.handleCopyCode(ctx, callback, data)
+		return
+	}
+
+	msg, account, ok := b.callbackTarget(ctx, callback, data)
+	if !ok {
 		return
 	}
 
 	switch data.Action {
 	case appmodels.CallbackMarkRead:
-		b.handleMarkRead(ctx, callback, data)
+		b.handleMarkRead(ctx, callback, msg, account)
 	case appmodels.CallbackDelete:
-		b.handleDelete(ctx, callback, data)
-	case appmodels.CallbackCopyCode:
-		b.handleCopyCode(ctx, callback, data)
+		b.setEmailKeyboard(ctx, account, msg, formatter.BuildDeleteConfirmKeyboard(msg.ID, parseCodes(msg)))
+		b.answerCallback(ctx, callback.ID, "Письмо будет удалено из почтового ящика. Подтвердите", false)
+	case appmodels.CallbackDeleteCancel:
+		b.setEmailKeyboard(ctx, account, msg, formatter.BuildEmailKeyboard(msg.ID, parseCodes(msg), msg.IsRead))
+		b.answerCallback(ctx, callback.ID, "Отменено", false)
+	case appmodels.CallbackDeleteConfirm:
+		b.handleDelete(ctx, callback, msg, account)
 	default:
 		b.answerCallback(ctx, callback.ID, "Неизвестное действие", false)
 	}
 }
 
-// handleMarkRead handles mark as read callback
-func (b *Bot) handleMarkRead(ctx context.Context, callback *models.CallbackQuery, data appmodels.CallbackData) {
-	// Get message from database
+// callbackTarget loads the email and account of a button and checks that
+// the user may act on it. It answers the callback itself when not ok.
+func (b *Bot) callbackTarget(ctx context.Context, callback *models.CallbackQuery, data appmodels.CallbackData) (*appmodels.EmailMessage, *appmodels.EmailAccount, bool) {
 	msg, err := b.db.GetMessageByID(ctx, data.MessageID)
 	if err != nil {
-		b.logger.Error("failed to get message", "error", err)
-		b.answerCallback(ctx, callback.ID, "Сообщение не найдено", false)
-		return
+		if !errors.Is(err, database.ErrNotFound) {
+			b.logger.Error("failed to get message", "error", err)
+		}
+		b.answerCallback(ctx, callback.ID, "Письмо не найдено (почта отключена?)", false)
+		return nil, nil, false
 	}
 
-	// Get account
 	account, err := b.db.GetAccountByID(ctx, msg.AccountID)
 	if err != nil {
-		b.logger.Error("failed to get account", "error", err)
-		b.answerCallback(ctx, callback.ID, "Аккаунт не найден", false)
-		return
+		if !errors.Is(err, database.ErrNotFound) {
+			b.logger.Error("failed to get account", "error", err)
+		}
+		b.answerCallback(ctx, callback.ID, "Почта отключена", false)
+		return nil, nil, false
 	}
 
-	// Mark as read in IMAP
+	// The button must belong to this account's chat
+	if callback.Message.Message != nil && callback.Message.Message.Chat.ID != account.ChatID {
+		b.answerCallback(ctx, callback.ID, "Кнопка не относится к этому чату", false)
+		return nil, nil, false
+	}
+
+	isAdmin, err := b.isChatAdmin(ctx, account.ChatID, callback.From.ID)
+	if err != nil {
+		b.logger.Error("failed to check admin status", "error", err)
+		b.answerCallback(ctx, callback.ID, "Ошибка проверки прав", false)
+		return nil, nil, false
+	}
+	if !isAdmin {
+		b.answerCallback(ctx, callback.ID, "Только администраторы могут управлять письмами", true)
+		return nil, nil, false
+	}
+
+	return msg, account, true
+}
+
+// handleMarkRead handles mark as read callback
+func (b *Bot) handleMarkRead(ctx context.Context, callback *models.CallbackQuery, msg *appmodels.EmailMessage, account *appmodels.EmailAccount) {
 	if err := b.emailManager.MarkAsRead(account.ID, msg.UID); err != nil {
 		b.logger.Error("failed to mark as read", "error", err)
-		b.answerCallback(ctx, callback.ID, "Ошибка: "+err.Error(), false)
+		b.answerCallback(ctx, callback.ID, "Ошибка: "+err.Error(), true)
 		return
 	}
 
-	// Update database
 	if err := b.db.MarkMessageAsRead(ctx, msg.ID); err != nil {
 		b.logger.Error("failed to update message", "error", err)
 	}
 
-	// Update keyboard
-	var codes []appmodels.DetectedCode
-	if msg.DetectedCodes != "" {
-		if err := json.Unmarshal([]byte(msg.DetectedCodes), &codes); err != nil {
-			b.logger.Warn("failed to parse detected codes", "error", err, "message_id", msg.ID)
-		}
-	}
-	keyboard := formatter.BuildEmailKeyboard(msg.ID, codes, true)
-	if err := b.editMessageReplyMarkup(ctx, account.ChatID, msg.TelegramMsgID, keyboard); err != nil {
-		b.logger.Warn("failed to update keyboard", "error", err)
-	}
-
+	b.setEmailKeyboard(ctx, account, msg, formatter.BuildEmailKeyboard(msg.ID, parseCodes(msg), true))
 	b.answerCallback(ctx, callback.ID, "Помечено как прочитанное", false)
 }
 
-// handleDelete handles delete callback
-func (b *Bot) handleDelete(ctx context.Context, callback *models.CallbackQuery, data appmodels.CallbackData) {
-	// Get message from database
-	msg, err := b.db.GetMessageByID(ctx, data.MessageID)
-	if err != nil {
-		b.logger.Error("failed to get message", "error", err)
-		b.answerCallback(ctx, callback.ID, "Сообщение не найдено", false)
-		return
-	}
-
-	// Get account
-	account, err := b.db.GetAccountByID(ctx, msg.AccountID)
-	if err != nil {
-		b.logger.Error("failed to get account", "error", err)
-		b.answerCallback(ctx, callback.ID, "Аккаунт не найден", false)
-		return
-	}
-
-	// Delete from IMAP
+// handleDelete deletes the email from the mailbox and the chat
+func (b *Bot) handleDelete(ctx context.Context, callback *models.CallbackQuery, msg *appmodels.EmailMessage, account *appmodels.EmailAccount) {
 	if err := b.emailManager.DeleteMessage(account.ID, msg.UID); err != nil {
 		b.logger.Error("failed to delete message", "error", err)
-		b.answerCallback(ctx, callback.ID, "Ошибка: "+err.Error(), false)
+		b.answerCallback(ctx, callback.ID, "Ошибка: "+err.Error(), true)
 		return
 	}
 
-	// Update database
 	if err := b.db.MarkMessageAsDeleted(ctx, msg.ID); err != nil {
 		b.logger.Error("failed to update message", "error", err)
 	}
 
-	// Delete Telegram message
 	if err := b.deleteMessage(ctx, account.ChatID, msg.TelegramMsgID); err != nil {
+		// Telegram does not let bots delete messages older than 48 hours
 		b.logger.Warn("failed to delete telegram message", "error", err)
+		b.editMessageReplyMarkup(ctx, account.ChatID, msg.TelegramMsgID, &models.InlineKeyboardMarkup{
+			InlineKeyboard: [][]models.InlineKeyboardButton{},
+		})
 	}
 
 	b.answerCallback(ctx, callback.ID, "Письмо удалено", false)
 }
 
-// handleCopyCode handles copy code callback
+// handleCopyCode handles buttons of messages sent by older versions
 func (b *Bot) handleCopyCode(ctx context.Context, callback *models.CallbackQuery, data appmodels.CallbackData) {
-	// Get message from database
 	msg, err := b.db.GetMessageByID(ctx, data.MessageID)
 	if err != nil {
-		b.logger.Error("failed to get message", "error", err)
-		b.answerCallback(ctx, callback.ID, "Сообщение не найдено", false)
+		b.answerCallback(ctx, callback.ID, "Письмо не найдено", false)
 		return
 	}
 
-	// Parse codes
-	codes := b.codeDetector.DetectCodes(msg.BodyText)
-	if data.CodeIndex >= len(codes) {
+	codes := parseCodes(msg)
+	if data.CodeIndex < 0 || data.CodeIndex >= len(codes) {
 		b.answerCallback(ctx, callback.ID, "Код не найден", false)
 		return
 	}
+	b.answerCallback(ctx, callback.ID, fmt.Sprintf("Код: %s", codes[data.CodeIndex].Value), true)
+}
 
-	code := codes[data.CodeIndex]
-	// Show alert with code (can be copied)
-	b.answerCallback(ctx, callback.ID, fmt.Sprintf("Код: %s", code.Value), true)
+func (b *Bot) setEmailKeyboard(ctx context.Context, account *appmodels.EmailAccount, msg *appmodels.EmailMessage, keyboard *models.InlineKeyboardMarkup) {
+	if err := b.editMessageReplyMarkup(ctx, account.ChatID, msg.TelegramMsgID, keyboard); err != nil {
+		b.logger.Warn("failed to update keyboard", "error", err)
+	}
+}
+
+// parseCodes returns the codes stored with a message
+func parseCodes(msg *appmodels.EmailMessage) []appmodels.DetectedCode {
+	var codes []appmodels.DetectedCode
+	if msg.DetectedCodes != "" {
+		_ = json.Unmarshal([]byte(msg.DetectedCodes), &codes)
+	}
+	return codes
+}
+
+// deletePasswordMessage removes a command containing a password and warns
+// if that is impossible
+func (b *Bot) deletePasswordMessage(ctx context.Context, msg *models.Message) {
+	if err := b.deleteMessage(ctx, msg.Chat.ID, msg.ID); err != nil {
+		b.logger.Warn("failed to delete message with password", "error", err)
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID,
+			"⚠️ Не удалось удалить сообщение с паролем. Удалите его вручную и дайте боту право «Удаление сообщений».")
+	}
 }
 
 // statusMessage is a progress message that is edited instead of sending new ones

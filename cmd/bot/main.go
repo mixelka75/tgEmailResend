@@ -38,8 +38,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// Stop on Ctrl+C / docker stop
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Run migrations
-	ctx := context.Background()
 	if err := db.Migrate(ctx); err != nil {
 		logger.Error("failed to run migrations", "error", err)
 		os.Exit(1)
@@ -56,15 +59,28 @@ func main() {
 	var mailcowClient *mailcow.Client
 	if cfg.MailcowEnabled() {
 		mailcowClient = mailcow.NewClient(mailcow.Config{
-			BaseURL: cfg.MailcowURL,
-			APIKey:  cfg.MailcowAPIKey,
-			Domain:  cfg.MailcowDomain,
+			BaseURL:    cfg.MailcowURL,
+			APIKey:     cfg.MailcowAPIKey,
+			Domain:     cfg.MailcowDomain,
+			IMAPServer: cfg.MailcowIMAPServer,
+			QuotaMB:    cfg.MailcowQuotaMB,
 		})
 		logger.Info("mailcow integration enabled", "domain", cfg.MailcowDomain)
+		go func() {
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := mailcowClient.Check(checkCtx); err != nil {
+				logger.Warn("mailcow API check failed, /create will not work until this is fixed", "error", err)
+			} else {
+				logger.Info("mailcow API is reachable", "domain", cfg.MailcowDomain)
+			}
+		}()
+	} else if cfg.MailcowURL != "" || cfg.MailcowAPIKey != "" || cfg.MailcowDomain != "" {
+		logger.Warn("mailcow integration disabled: set all of MAILCOW_URL, MAILCOW_API_KEY and MAILCOW_DOMAIN")
 	}
 
 	// Create bot
-	bot, err := telegram.NewBot(telegram.BotDeps{
+	bot, err := telegram.NewBot(ctx, telegram.BotDeps{
 		Config:       cfg,
 		DB:           db,
 		EmailManager: emailManager,
@@ -75,6 +91,10 @@ func main() {
 		Logger:       logger,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			logger.Info("stopped before the bot started")
+			return
+		}
 		logger.Error("failed to create bot", "error", err)
 		os.Exit(1)
 	}
@@ -94,24 +114,12 @@ func main() {
 		emailManager.RestoreAll(ctx, accounts)
 	}
 
-	// Setup graceful shutdown
-	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-sigCh
-
-		logger.Info("received shutdown signal", "signal", sig)
-		logger.Info("shutting down...")
-
-		emailManager.StopAll()
-		cancel()
-	}()
-
-	// Start bot
+	// Start bot; returns when a shutdown signal arrives
 	logger.Info("bot is running, press Ctrl+C to stop")
 	bot.Start(ctx)
 
+	logger.Info("shutting down...")
+	emailManager.StopAll()
 	logger.Info("bot stopped")
 }
 

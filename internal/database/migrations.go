@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS email_accounts (
     topic_id INTEGER NOT NULL,
     is_active BOOLEAN DEFAULT true,
     last_uid INTEGER DEFAULT 0,
+    uid_validity INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_by INTEGER NOT NULL,
@@ -41,3 +42,10 @@ CREATE INDEX IF NOT EXISTS idx_accounts_active ON email_accounts(is_active);
 CREATE INDEX IF NOT EXISTS idx_messages_account ON email_messages(account_id);
 CREATE INDEX IF NOT EXISTS idx_messages_telegram ON email_messages(telegram_msg_id);
 `
+
+// addedColumns are applied to databases created by older versions
+var addedColumns = []struct {
+	table, name, definition string
+}{
+	{"email_accounts", "uid_validity", "INTEGER NOT NULL DEFAULT 0"},
+}

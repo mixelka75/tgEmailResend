@@ -117,3 +117,12 @@ func (db *DB) MarkMessageAsDeleted(ctx context.Context, id int64) error {
 	}
 	return nil
 }
+
+// DeleteMessage removes a message record (used when delivery failed and will be retried)
+func (db *DB) DeleteMessage(ctx context.Context, id int64) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM email_messages WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete message: %w", err)
+	}
+	return nil
+}

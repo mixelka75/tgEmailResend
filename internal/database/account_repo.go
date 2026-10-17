@@ -21,8 +21,8 @@ var ErrAlreadyExists = errors.New("record already exists")
 // CreateAccount creates a new email account
 func (db *DB) CreateAccount(ctx context.Context, account *models.EmailAccount) error {
 	query := `
-		INSERT INTO email_accounts (email, password, imap_server, chat_id, topic_id, is_active, last_uid, created_by, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO email_accounts (email, password, imap_server, chat_id, topic_id, is_active, last_uid, uid_validity, created_by, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	now := time.Now()
 	result, err := db.ExecContext(ctx, query,
@@ -33,6 +33,7 @@ func (db *DB) CreateAccount(ctx context.Context, account *models.EmailAccount) e
 		account.TopicID,
 		account.IsActive,
 		account.LastUID,
+		account.UIDValidity,
 		account.CreatedBy,
 		now,
 		now,
@@ -104,6 +105,16 @@ func (db *DB) GetAllActiveAccounts(ctx context.Context) ([]*models.EmailAccount,
 		return nil, fmt.Errorf("failed to get active accounts: %w", err)
 	}
 	return accounts, nil
+}
+
+// UpdateAccountSync updates the last processed UID and the mailbox UIDVALIDITY
+func (db *DB) UpdateAccountSync(ctx context.Context, id int64, uid, uidValidity uint32) error {
+	query := `UPDATE email_accounts SET last_uid = ?, uid_validity = ?, updated_at = ? WHERE id = ?`
+	_, err := db.ExecContext(ctx, query, uid, uidValidity, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("failed to update sync state: %w", err)
+	}
+	return nil
 }
 
 // UpdateAccountLastUID updates the last processed UID

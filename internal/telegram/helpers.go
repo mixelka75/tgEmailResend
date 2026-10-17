@@ -24,14 +24,18 @@ func (b *Bot) isUserAdmin(ctx context.Context, msg *models.Message) (bool, error
 	if msg.From == nil {
 		return false, nil
 	}
+	return b.isChatAdmin(ctx, msg.Chat.ID, msg.From.ID)
+}
 
+// isChatAdmin checks if a user is an admin in the chat
+func (b *Bot) isChatAdmin(ctx context.Context, chatID, userID int64) (bool, error) {
 	// Use separate context with timeout to avoid blocking
 	apiCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	member, err := b.bot.GetChatMember(apiCtx, &bot.GetChatMemberParams{
-		ChatID: msg.Chat.ID,
-		UserID: msg.From.ID,
+		ChatID: chatID,
+		UserID: userID,
 	})
 	if err != nil {
 		return false, err
@@ -226,16 +230,4 @@ func (b *Bot) decryptPassword(encrypted string) (string, error) {
 	}
 
 	return string(plaintext), nil
-}
-
-// DecryptPasswordFunc returns a function for decrypting passwords
-func (b *Bot) DecryptPasswordFunc() func(string) string {
-	return func(encrypted string) string {
-		decrypted, err := b.decryptPassword(encrypted)
-		if err != nil {
-			b.logger.Error("failed to decrypt password", "error", err)
-			return ""
-		}
-		return decrypted
-	}
 }

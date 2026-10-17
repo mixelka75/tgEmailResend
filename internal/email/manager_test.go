@@ -1,14 +1,17 @@
 package email
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,6 +104,26 @@ func messageFlags(t *testing.T, be *memory.Backend, uid uint32) []string {
 	return nil
 }
 
+func setFlags(t *testing.T, be *memory.Backend, uid uint32, flags ...string) {
+	t.Helper()
+	user, _ := be.Login(nil, "username", "password")
+	mbox, _ := user.GetMailbox("INBOX")
+	for _, m := range mbox.(*memory.Mailbox).Messages {
+		if m.Uid == uid {
+			m.Flags = append(m.Flags, flags...)
+		}
+	}
+}
+
+func hasFlag(flags []string, flag string) bool {
+	for _, f := range flags {
+		if f == flag {
+			return true
+		}
+	}
+	return false
+}
+
 func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
 	select {
@@ -128,8 +151,15 @@ func TestManagerEndToEnd(t *testing.T) {
 
 	received := make(chan *RawEmail, 10)
 	baseline := make(chan uint32, 1)
-	m.SetMessageHandler(func(_ int64, msg *RawEmail) { received <- msg })
-	m.SetLastUIDHandler(func(_ int64, uid uint32) { baseline <- uid })
+	var failNext atomic.Bool
+	m.SetMessageHandler(func(_ int64, msg *RawEmail) error {
+		if failNext.CompareAndSwap(true, false) {
+			return errors.New("telegram is down")
+		}
+		received <- msg
+		return nil
+	})
+	m.SetSyncHandler(func(_ int64, uid, _ uint32) { baseline <- uid })
 
 	if err := m.TestConnection(t.Context(), "username", "password", addr); err != nil {
 		t.Fatalf("TestConnection: %v", err)
@@ -149,6 +179,8 @@ func TestManagerEndToEnd(t *testing.T) {
 		t.Fatalf("baseline UID = %d, want 6", uid)
 	}
 
+	// The first delivery attempt fails: the message must be retried, not lost
+	failNext.Store(true)
 	appendMessage(t, be, "Login", "Код подтверждения: 482913")
 	msg := waitFor(t, received, "new message")
 	if msg.UID != 7 || msg.Subject != "Login" || !strings.Contains(msg.BodyText, "482913") {
@@ -191,8 +223,17 @@ func TestManagerEndToEnd(t *testing.T) {
 	case <-time.After(time.Second):
 	}
 
+	// Another mail client flagged UID 7 as \Deleted without expunging:
+	// deleting UID 8 must not wipe it
+	setFlags(t, be, 7, imap.DeletedFlag)
 	if err := m.DeleteMessage(1, 8); err != nil {
 		t.Fatalf("DeleteMessage: %v", err)
+	}
+	if messageFlags(t, be, 7) == nil {
+		t.Fatal("DeleteMessage expunged another message")
+	}
+	if !hasFlag(messageFlags(t, be, 8), imap.DeletedFlag) {
+		t.Fatal("deleted message is not flagged \\Deleted")
 	}
 	if m.GetStatus(1) != StatusConnected {
 		t.Errorf("status = %s, want connected", m.GetStatus(1))
@@ -201,5 +242,60 @@ func TestManagerEndToEnd(t *testing.T) {
 	m.RemoveAccount(1)
 	if err := m.MarkAsRead(1, 7); err != ErrNotConnected {
 		t.Errorf("MarkAsRead after remove = %v, want ErrNotConnected", err)
+	}
+}
+
+func newTestManager(t *testing.T, clientTLS *tls.Config) *Manager {
+	t.Helper()
+	minBackoff = 100 * time.Millisecond
+	cfg := &config.Config{
+		IMAPIdleTimeout:   time.Minute,
+		IMAPDialTimeout:   5 * time.Second,
+		EmailPollInterval: 300 * time.Millisecond,
+	}
+	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.tlsConfig = clientTLS
+	return m
+}
+
+func TestDeleteMovesToTrash(t *testing.T) {
+	addr, be, _, clientTLS := startIMAPServer(t)
+	user, _ := be.Login(nil, "username", "password")
+	if err := user.CreateMailbox("Trash"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestManager(t, clientTLS)
+	synced := make(chan uint32, 1)
+	m.SetMessageHandler(func(int64, *RawEmail) error { return nil })
+	m.SetSyncHandler(func(_ int64, uid, _ uint32) { synced <- uid })
+	m.AddAccount(context.Background(), &models.EmailAccount{ID: 1, Email: "username", Password: "password", IMAPServer: addr})
+	defer m.StopAll()
+	waitFor(t, synced, "baseline")
+
+	if err := m.DeleteMessage(1, 6); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	trash, _ := user.GetMailbox("Trash")
+	if n := len(trash.(*memory.Mailbox).Messages); n != 1 {
+		t.Fatalf("Trash has %d messages, want 1", n)
+	}
+}
+
+func TestDecryptErrorStopsAccount(t *testing.T) {
+	m := newTestManager(t, nil)
+	errs := make(chan error, 2)
+	m.SetDecryptFunc(func(string) (string, error) { return "", errors.New("bad key") })
+	m.SetErrorHandler(func(_ int64, err error) { errs <- err })
+	m.AddAccount(context.Background(), &models.EmailAccount{ID: 1, Email: "x", Password: "enc", IMAPServer: "127.0.0.1:1"})
+	defer m.StopAll()
+
+	if err := waitFor(t, errs, "decrypt error"); !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("error = %v, want ErrDecrypt", err)
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("decrypt error reported twice: %v", err)
+	case <-time.After(500 * time.Millisecond):
 	}
 }

@@ -1,7 +1,10 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -12,6 +15,10 @@ import (
 type Config struct {
 	// Telegram
 	TelegramToken string `env:"TELEGRAM_BOT_TOKEN,required"`
+	// Local Bot API server, e.g. http://localhost:8081 (optional)
+	TelegramAPIURL string `env:"TELEGRAM_API_URL"`
+	// Send emails as rich messages (Bot API 10.1+); falls back to HTML automatically
+	TelegramRichMessages bool `env:"TELEGRAM_RICH_MESSAGES" envDefault:"true"`
 
 	// Database
 	DatabasePath string `env:"DATABASE_PATH" envDefault:"./data/emailbot.db"`
@@ -25,6 +32,10 @@ type Config struct {
 	MailcowURL    string `env:"MAILCOW_URL"` // e.g., https://mail.example.com
 	MailcowAPIKey string `env:"MAILCOW_API_KEY"`
 	MailcowDomain string `env:"MAILCOW_DOMAIN"` // e.g., example.com
+	// IMAP server of created mailboxes, host:port (default: MAILCOW_URL host, port 993)
+	MailcowIMAPServer string `env:"MAILCOW_IMAP_SERVER"`
+	// Quota of created mailboxes in MB (default: the domain's default quota)
+	MailcowQuotaMB int `env:"MAILCOW_MAILBOX_QUOTA_MB"`
 
 	// Security
 	EncryptionKey string `env:"ENCRYPTION_KEY,required"`
@@ -49,10 +60,48 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	// Validate encryption key length (32 bytes for AES-256)
-	if len(cfg.EncryptionKey) != 32 {
-		return nil, fmt.Errorf("ENCRYPTION_KEY must be exactly 32 bytes, got %d", len(cfg.EncryptionKey))
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (c *Config) validate() error {
+	c.TelegramToken = strings.TrimSpace(c.TelegramToken)
+	if !strings.Contains(c.TelegramToken, ":") {
+		return errors.New("TELEGRAM_BOT_TOKEN looks invalid, expected the token from @BotFather like 123456:ABC-DEF")
 	}
 
-	return cfg, nil
+	// 32 bytes for AES-256
+	if len(c.EncryptionKey) != 32 {
+		return fmt.Errorf("ENCRYPTION_KEY must be exactly 32 bytes, got %d (generate one with: make generate-key)", len(c.EncryptionKey))
+	}
+
+	if c.EmailPollInterval < 10*time.Second {
+		return fmt.Errorf("EMAIL_POLL_INTERVAL must be at least 10s, got %s", c.EmailPollInterval)
+	}
+	if c.IMAPIdleTimeout < time.Minute || c.IMAPIdleTimeout > 29*time.Minute {
+		return fmt.Errorf("IMAP_IDLE_TIMEOUT must be between 1m and 29m, got %s", c.IMAPIdleTimeout)
+	}
+	if c.IMAPDialTimeout < time.Second {
+		return fmt.Errorf("IMAP_DIAL_TIMEOUT must be at least 1s, got %s", c.IMAPDialTimeout)
+	}
+
+	for name, raw := range map[string]string{"TELEGRAM_API_URL": c.TelegramAPIURL, "MAILCOW_URL": c.MailcowURL} {
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s must be an http(s) URL, got %q", name, raw)
+		}
+	}
+	c.TelegramAPIURL = strings.TrimRight(c.TelegramAPIURL, "/")
+	c.MailcowDomain = strings.ToLower(strings.TrimSpace(c.MailcowDomain))
+
+	if c.MailcowQuotaMB < 0 {
+		return fmt.Errorf("MAILCOW_MAILBOX_QUOTA_MB must not be negative, got %d", c.MailcowQuotaMB)
+	}
+
+	return nil
 }

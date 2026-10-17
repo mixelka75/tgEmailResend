@@ -2,10 +2,13 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -29,6 +32,7 @@ type Bot struct {
 	formatter    *formatter.TelegramFormatter
 	logger       *slog.Logger
 	config       *config.Config
+	richDisabled atomic.Bool
 }
 
 // BotDeps dependencies for creating a bot
@@ -43,8 +47,9 @@ type BotDeps struct {
 	Logger       *slog.Logger
 }
 
-// NewBot creates a new Telegram bot
-func NewBot(deps BotDeps) (*Bot, error) {
+// NewBot creates a new Telegram bot. It waits for Telegram to become
+// reachable; only an invalid token is a fatal error.
+func NewBot(ctx context.Context, deps BotDeps) (*Bot, error) {
 	b := &Bot{
 		db:           deps.DB,
 		emailManager: deps.EmailManager,
@@ -55,24 +60,98 @@ func NewBot(deps BotDeps) (*Bot, error) {
 		logger:       deps.Logger.With("component", "telegram_bot"),
 		config:       deps.Config,
 	}
+	b.richDisabled.Store(!deps.Config.TelegramRichMessages)
 
 	opts := []bot.Option{
+		bot.WithSkipGetMe(),
 		bot.WithDefaultHandler(b.defaultHandler),
 		bot.WithMiddlewares(b.recoverMiddleware),
 		bot.WithErrorsHandler(func(err error) {
 			b.logger.Warn("telegram polling error", "error", err)
 		}),
+		bot.WithAllowedUpdates(bot.AllowedUpdates{
+			models.AllowedUpdateMessage,
+			models.AllowedUpdateCallbackQuery,
+		}),
+	}
+	if deps.Config.TelegramAPIURL != "" {
+		opts = append(opts, bot.WithServerURL(deps.Config.TelegramAPIURL))
 	}
 
 	tgBot, err := bot.New(deps.Config.TelegramToken, opts...)
 	if err != nil {
 		return nil, err
 	}
-
 	b.bot = tgBot
-	b.registerHandlers()
 
+	if err := b.waitForTelegram(ctx); err != nil {
+		return nil, err
+	}
+
+	b.registerHandlers()
 	return b, nil
+}
+
+// waitForTelegram checks the token, retrying while Telegram is unreachable
+func (b *Bot) waitForTelegram(ctx context.Context) error {
+	delay := 5 * time.Second
+	for {
+		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		me, err := b.bot.GetMe(reqCtx)
+		cancel()
+		if err == nil {
+			b.logger.Info("authorized in telegram", "username", me.Username)
+			return nil
+		}
+		if errors.Is(err, bot.ErrorUnauthorized) || errors.Is(err, bot.ErrorNotFound) {
+			return fmt.Errorf("invalid TELEGRAM_BOT_TOKEN: %w", err)
+		}
+
+		b.logger.Warn("telegram is unreachable, retrying", "error", err, "retry_in", delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, time.Minute)
+	}
+}
+
+// prepare removes a webhook left from another deployment (getUpdates fails
+// while one is set) and publishes the command menu
+func (b *Bot) prepare(ctx context.Context) {
+	if _, err := b.bot.DeleteWebhook(ctx, &bot.DeleteWebhookParams{}); err != nil {
+		b.logger.Warn("failed to delete webhook", "error", err)
+	}
+
+	commands := []models.BotCommand{
+		{Command: "connect", Description: "Подключить почту к топику"},
+		{Command: "disconnect", Description: "Отключить почту от топика"},
+		{Command: "status", Description: "Статус подключений"},
+		{Command: "help", Description: "Справка"},
+	}
+	if b.mailcow != nil && b.mailcow.IsConfigured() {
+		commands = append(commands[:1], append([]models.BotCommand{
+			{Command: "create", Description: "Создать ящик на " + b.mailcow.GetDomain()},
+		}, commands[1:]...)...)
+	}
+	_, err := b.bot.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+		Commands: commands,
+		Scope:    &models.BotCommandScopeAllGroupChats{},
+	})
+	if err != nil {
+		b.logger.Warn("failed to set bot commands", "error", err)
+	}
+}
+
+func (b *Bot) richEnabled() bool {
+	return !b.richDisabled.Load()
+}
+
+func (b *Bot) disableRich() {
+	if !b.richDisabled.Swap(true) {
+		b.logger.Warn("rich messages are not supported by the Bot API server, using HTML messages")
+	}
 }
 
 // registerHandlers registers command handlers
@@ -116,6 +195,7 @@ func (b *Bot) recoverMiddleware(next bot.HandlerFunc) bot.HandlerFunc {
 // Start starts the bot
 func (b *Bot) Start(ctx context.Context) {
 	b.logger.Info("starting telegram bot")
+	b.prepare(ctx)
 	b.bot.Start(ctx)
 }
 
@@ -152,7 +232,8 @@ func (b *Bot) handleHelp(ctx context.Context, tgBot *bot.Bot, update *models.Upd
 2. Включите топики в настройках группы
 3. Добавьте бота в группу
 4. Сделайте бота администратором
-5. В нужном топике используйте /connect
+5. Дайте боту право «Удаление сообщений»
+6. В нужном топике используйте /connect
 
 <b>Почему нужны топики?</b>
 Каждый email-аккаунт привязывается к отдельному топику. Это позволяет удобно разделять письма от разных аккаунтов.
@@ -203,9 +284,16 @@ func (b *Bot) handleHelp(ctx context.Context, tgBot *bot.Bot, update *models.Upd
 <code>/connect user@gmail.com app_password</code>
 <code>/connect user@mail.ru pass imap.mail.ru:993</code>
 
+<b>Кнопки под письмами:</b>
+• код — копирует код подтверждения
+• «Прочитано» — помечает письмо прочитанным в ящике
+• «Удалить» — переносит письмо в Корзину ящика (с подтверждением)
+
 <b>Важно:</b>
-• Только администраторы могут управлять почтами
-• Для Gmail/Yandex нужен пароль приложения
+• Управлять почтой и нажимать кнопки могут только администраторы
+• Боту нужно право «Удаление сообщений», чтобы стирать команды с паролями
+• Для Gmail, Яндекса, Mail.ru и iCloud нужен пароль приложения
+• Outlook/Microsoft 365 не поддерживаются (Microsoft запретила вход по паролю)
 • IMAP сервер определяется автоматически`
 
 	b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, text)

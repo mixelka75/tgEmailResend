@@ -4,9 +4,11 @@ package models
 type CallbackAction string
 
 const (
-	CallbackMarkRead CallbackAction = "mr"
-	CallbackDelete   CallbackAction = "del"
-	CallbackCopyCode CallbackAction = "cc"
+	CallbackMarkRead      CallbackAction = "mr"
+	CallbackDelete        CallbackAction = "del" // asks for confirmation
+	CallbackDeleteConfirm CallbackAction = "dy"
+	CallbackDeleteCancel  CallbackAction = "dn"
+	CallbackCopyCode      CallbackAction = "cc" // legacy buttons of old messages
 )
 
 // CallbackData structure for inline button callback

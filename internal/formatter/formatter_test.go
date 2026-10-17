@@ -23,7 +23,7 @@ func TestFormatEmailEscapesAndTruncates(t *testing.T) {
 	if strings.Contains(text, "<script>") || strings.Contains(text, "<Jerry>") {
 		t.Errorf("user content is not escaped: %q", text[:200])
 	}
-	if !strings.HasSuffix(text, "<i>... (сообщение обрезано)</i>") {
+	if !strings.HasSuffix(text, "<i>… сообщение обрезано</i>") {
 		t.Errorf("truncation marker must stay real HTML, got tail %q", text[len(text)-60:])
 	}
 	if n := utf8.RuneCountInString(stripTags(text)); n > 4096 {

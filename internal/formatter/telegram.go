@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"html"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mixelka/emailresend/pkg/models"
 )
@@ -20,48 +21,59 @@ func NewTelegramFormatter() *TelegramFormatter {
 	}
 }
 
-// FormatEmail formats an email message for Telegram
+// FormatEmail formats an email for sendMessage with HTML parse mode.
+// It is the fallback when a rich message cannot be sent.
 func (f *TelegramFormatter) FormatEmail(msg *models.EmailMessage, codes []models.DetectedCode) string {
 	var sb strings.Builder
 
-	// Header
-	from := msg.FromAddr
-	if msg.FromName != "" {
-		from = fmt.Sprintf("%s &lt;%s&gt;", f.escapeHTML(msg.FromName), f.escapeHTML(msg.FromAddr))
-	} else {
-		from = f.escapeHTML(from)
+	subject := strings.TrimSpace(msg.Subject)
+	if subject == "" {
+		subject = "(без темы)"
 	}
+	subject, _ = f.truncate(subject, 300)
 
-	sb.WriteString(fmt.Sprintf("<b>От:</b> %s\n", from))
-	subject, _ := f.truncate(msg.Subject, 300)
-	sb.WriteString(fmt.Sprintf("<b>Тема:</b> %s\n", f.escapeHTML(subject)))
-	sb.WriteString(fmt.Sprintf("<b>Дата:</b> %s\n", msg.ReceivedAt.Format("02.01.2006 15:04")))
+	sb.WriteString(fmt.Sprintf("<b>%s</b>\n", f.escapeHTML(subject)))
+	sb.WriteString(fmt.Sprintf("<b>От:</b> %s\n", f.formatFrom(msg)))
+	sb.WriteString(fmt.Sprintf("<b>Дата:</b> %s\n", formatTime(msg)))
+
+	if len(codes) > 0 {
+		sb.WriteString("<b>Код:</b>")
+		for _, code := range codes {
+			sb.WriteString(" <code>" + f.escapeHTML(code.Value) + "</code>")
+		}
+		sb.WriteString("\n")
+	}
 	sb.WriteString("\n")
 
-	// Detected codes section
-	if len(codes) > 0 {
-		sb.WriteString("<b>Коды:</b>\n")
-		for _, code := range codes {
-			sb.WriteString(fmt.Sprintf("<code>%s</code> ", f.escapeHTML(code.Value)))
-		}
-		sb.WriteString("\n\n")
+	// Telegram counts the limit in characters of the text after entities
+	// are parsed, so count runes of the unescaped text
+	headerRunes := len([]rune(stripTags(sb.String())))
+	body, truncated := f.truncate(strings.TrimSpace(msg.BodyText), f.maxLength-headerRunes-60)
+	if body == "" {
+		sb.WriteString("<i>(пустое письмо)</i>")
+		return sb.String()
 	}
 
-	// Body. Telegram counts the limit in characters of the text after
-	// entities are parsed, so count runes of the unescaped text.
-	header := sb.String()
-	sb.WriteString("<b>Сообщение:</b>\n")
-	headerRunes := len([]rune(stripTags(header))) + len("Сообщение:\n")
-	body, truncated := f.truncate(strings.TrimSpace(msg.BodyText), f.maxLength-headerRunes-50)
-	if body == "" {
-		body = "(пустое письмо)"
+	// Long bodies are collapsed so the chat stays readable
+	if utf8.RuneCountInString(body) > 800 {
+		sb.WriteString("<blockquote expandable>" + f.escapeHTML(body) + "</blockquote>")
+	} else {
+		sb.WriteString(f.escapeHTML(body))
 	}
-	sb.WriteString(f.escapeHTML(body))
 	if truncated {
-		sb.WriteString("\n\n<i>... (сообщение обрезано)</i>")
+		sb.WriteString("\n<i>… сообщение обрезано</i>")
 	}
 
 	return sb.String()
+}
+
+// PlainEmail formats an email without any markup: the last resort when
+// Telegram rejects formatted text
+func (f *TelegramFormatter) PlainEmail(msg *models.EmailMessage) string {
+	text := fmt.Sprintf("%s\nОт: %s <%s>\nДата: %s\n\n%s",
+		msg.Subject, msg.FromName, msg.FromAddr, msg.ReceivedAt.Format("02.01.2006 15:04"), msg.BodyText)
+	text, _ = f.truncate(text, f.maxLength)
+	return text
 }
 
 // escapeHTML escapes HTML special characters for Telegram

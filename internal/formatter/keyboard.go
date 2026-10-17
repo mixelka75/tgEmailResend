@@ -8,42 +8,28 @@ import (
 	appmodels "github.com/mixelka/emailresend/pkg/models"
 )
 
+// Button styles (Bot API 9.4)
+const (
+	styleSuccess = "success"
+	styleDanger  = "danger"
+	stylePrimary = "primary"
+)
+
 // BuildEmailKeyboard creates an inline keyboard for an email message
 func BuildEmailKeyboard(msgID int64, codes []appmodels.DetectedCode, isRead bool) *models.InlineKeyboardMarkup {
-	var rows [][]models.InlineKeyboardButton
+	rows := codeRows(codes)
 
-	// Code buttons: tapping copies the code to the clipboard
-	if len(codes) > 0 {
-		var codeButtons []models.InlineKeyboardButton
-		for _, code := range codes {
-			codeButtons = append(codeButtons, models.InlineKeyboardButton{
-				Text:     code.Value,
-				CopyText: &models.CopyTextButton{Text: code.Value},
-			})
-		}
-		// Split into rows of 2 buttons each
-		for i := 0; i < len(codeButtons); i += 2 {
-			end := i + 2
-			if end > len(codeButtons) {
-				end = len(codeButtons)
-			}
-			rows = append(rows, codeButtons[i:end])
-		}
-	}
-
-	// Action buttons
 	actionRow := []models.InlineKeyboardButton{}
-
 	if !isRead {
 		actionRow = append(actionRow, models.InlineKeyboardButton{
-			Text: "Прочитано",
+			Text:  "Прочитано",
+			Style: styleSuccess,
 			CallbackData: EncodeCallback(appmodels.CallbackData{
 				Action:    appmodels.CallbackMarkRead,
 				MessageID: msgID,
 			}),
 		})
 	}
-
 	actionRow = append(actionRow, models.InlineKeyboardButton{
 		Text: "Удалить",
 		CallbackData: EncodeCallback(appmodels.CallbackData{
@@ -51,12 +37,53 @@ func BuildEmailKeyboard(msgID int64, codes []appmodels.DetectedCode, isRead bool
 			MessageID: msgID,
 		}),
 	})
-
 	rows = append(rows, actionRow)
 
-	return &models.InlineKeyboardMarkup{
-		InlineKeyboard: rows,
+	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// BuildDeleteConfirmKeyboard asks to confirm deleting an email
+func BuildDeleteConfirmKeyboard(msgID int64, codes []appmodels.DetectedCode) *models.InlineKeyboardMarkup {
+	rows := codeRows(codes)
+	rows = append(rows, []models.InlineKeyboardButton{
+		{
+			Text:  "Да, удалить из ящика",
+			Style: styleDanger,
+			CallbackData: EncodeCallback(appmodels.CallbackData{
+				Action:    appmodels.CallbackDeleteConfirm,
+				MessageID: msgID,
+			}),
+		},
+		{
+			Text: "Отмена",
+			CallbackData: EncodeCallback(appmodels.CallbackData{
+				Action:    appmodels.CallbackDeleteCancel,
+				MessageID: msgID,
+			}),
+		},
+	})
+	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// codeRows returns buttons that copy detected codes, two per row
+func codeRows(codes []appmodels.DetectedCode) [][]models.InlineKeyboardButton {
+	var rows [][]models.InlineKeyboardButton
+	var row []models.InlineKeyboardButton
+	for _, code := range codes {
+		row = append(row, models.InlineKeyboardButton{
+			Text:     "Копировать " + code.Value,
+			Style:    stylePrimary,
+			CopyText: &models.CopyTextButton{Text: code.Value},
+		})
+		if len(row) == 2 {
+			rows = append(rows, row)
+			row = nil
+		}
 	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 // EncodeCallback encodes callback data to string

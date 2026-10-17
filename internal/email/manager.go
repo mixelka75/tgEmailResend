@@ -5,10 +5,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 
 	"github.com/mixelka/emailresend/internal/config"
@@ -17,7 +19,7 @@ import (
 
 const (
 	// Messages fetched per batch
-	fetchBatchSize = 20
+	fetchBatchSize = 10
 	// Notify the chat after this many failed connection attempts in a row
 	notifyAfterFailures = 3
 	maxBackoff          = 5 * time.Minute
@@ -30,8 +32,12 @@ var minBackoff = 5 * time.Second
 // ErrNotConnected is returned when an account has no active connection
 var ErrNotConnected = errors.New("нет подключения к почтовому серверу")
 
-// MessageHandler handles new email messages
-type MessageHandler func(accountID int64, msg *RawEmail)
+// ErrDecrypt means a stored password cannot be decrypted (ENCRYPTION_KEY changed)
+var ErrDecrypt = errors.New("не удалось расшифровать пароль: ENCRYPTION_KEY изменился")
+
+// MessageHandler handles new email messages. A returned error means the
+// message was not delivered and must be retried later.
+type MessageHandler func(accountID int64, msg *RawEmail) error
 
 // ErrorHandler handles persistent connection errors
 type ErrorHandler func(accountID int64, err error)
@@ -39,8 +45,8 @@ type ErrorHandler func(accountID int64, err error)
 // RecoverHandler is called when a connection is restored after an error was reported
 type RecoverHandler func(accountID int64)
 
-// LastUIDHandler persists the last processed UID
-type LastUIDHandler func(accountID int64, uid uint32)
+// SyncHandler persists the UID baseline and UIDVALIDITY of an account
+type SyncHandler func(accountID int64, lastUID, uidValidity uint32)
 
 // Status of an account connection
 const (
@@ -58,8 +64,8 @@ type Manager struct {
 	onMessage   MessageHandler
 	onError     ErrorHandler
 	onRecover   RecoverHandler
-	onLastUID   LastUIDHandler
-	decryptFunc func(string) string
+	onSync      SyncHandler
+	decryptFunc func(string) (string, error)
 	tlsConfig   *tls.Config // overridden in tests
 }
 
@@ -95,13 +101,13 @@ func (m *Manager) SetRecoverHandler(handler RecoverHandler) {
 	m.onRecover = handler
 }
 
-// SetLastUIDHandler sets the handler that persists the initial UID baseline
-func (m *Manager) SetLastUIDHandler(handler LastUIDHandler) {
-	m.onLastUID = handler
+// SetSyncHandler sets the handler that persists the UID baseline
+func (m *Manager) SetSyncHandler(handler SyncHandler) {
+	m.onSync = handler
 }
 
 // SetDecryptFunc sets the password decryption function
-func (m *Manager) SetDecryptFunc(fn func(string) string) {
+func (m *Manager) SetDecryptFunc(fn func(string) (string, error)) {
 	m.decryptFunc = fn
 }
 
@@ -151,22 +157,53 @@ func (m *Manager) AddAccount(ctx context.Context, account *models.EmailAccount) 
 	return nil
 }
 
-// runClient keeps the connection alive and forwards new messages
+// runClient keeps the connection alive and forwards new messages.
+// A panic restarts the loop instead of crashing the whole bot.
 func (m *Manager) runClient(ctx context.Context, w *clientWrapper) {
 	defer close(w.done)
 
+	for ctx.Err() == nil {
+		if m.runClientOnce(ctx, w) {
+			return
+		}
+		// Recovered from a panic
+		if !m.sleep(ctx, w.cmds, time.Minute) {
+			return
+		}
+	}
+}
+
+// runClientOnce returns true when the account must stop, false after a panic
+func (m *Manager) runClientOnce(ctx context.Context, w *clientWrapper) (stop bool) {
 	account := w.account
 	logger := m.logger.With("email", account.Email, "account_id", account.ID)
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("panic in email client, restarting", "panic", r, "stack", string(debug.Stack()))
+			w.connected.Store(false)
+			stop = false
+		}
+	}()
+
 	password := account.Password
 	if m.decryptFunc != nil {
-		password = m.decryptFunc(password)
+		var err error
+		password, err = m.decryptFunc(password)
+		if err != nil {
+			// Retrying cannot help: ENCRYPTION_KEY was changed
+			logger.Error("failed to decrypt password", "error", err)
+			if m.onError != nil {
+				m.onError(account.ID, ErrDecrypt)
+			}
+			<-ctx.Done()
+			return true
+		}
 	}
 
 	c := NewClient(m.clientConfig(account.Email, password, account.IMAPServer), m.logger)
 	defer c.Close()
 
-	lastUID := account.LastUID
 	failures := 0
 	notified := false
 	backoff := minBackoff
@@ -175,6 +212,9 @@ func (m *Manager) runClient(ctx context.Context, w *clientWrapper) {
 		// Connect
 		mbox, err := c.Connect(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return true
+			}
 			failures++
 			logger.Warn("IMAP connection failed", "error", err, "attempt", failures, "retry_in", backoff)
 			if failures == notifyAfterFailures && m.onError != nil {
@@ -182,7 +222,7 @@ func (m *Manager) runClient(ctx context.Context, w *clientWrapper) {
 				notified = true
 			}
 			if !m.sleep(ctx, w.cmds, backoff) {
-				return
+				return true
 			}
 			backoff = min(backoff*2, maxBackoff)
 			continue
@@ -194,47 +234,87 @@ func (m *Manager) runClient(ctx context.Context, w *clientWrapper) {
 		}
 		failures, notified, backoff = 0, false, minBackoff
 
-		// First connection of a new account: skip existing mail
-		if lastUID == 0 {
-			if uid, err := c.HighestUID(mbox); err != nil {
-				logger.Warn("failed to get highest UID", "error", err)
-			} else if uid > 0 {
-				lastUID = uid
-				if m.onLastUID != nil {
-					m.onLastUID(account.ID, uid)
-				}
-				logger.Info("initial UID baseline set", "uid", uid)
-			}
-		}
+		m.syncBaseline(c, mbox, account, logger)
 
 		// Fetch / wait loop while the connection is alive
-		err = m.serve(ctx, c, w, &lastUID)
+		err = m.serve(ctx, c, w)
 		w.connected.Store(false)
 		c.Close()
 		if ctx.Err() != nil {
-			return
+			return true
 		}
 		logger.Warn("IMAP connection lost, reconnecting", "error", err)
 		if !m.sleep(ctx, w.cmds, minBackoff) {
-			return
+			return true
 		}
+	}
+	return true
+}
+
+// syncBaseline sets the starting UID for a new account and after the server
+// renumbered the mailbox (UIDVALIDITY changed). Existing mail is skipped.
+func (m *Manager) syncBaseline(c *Client, mbox *imap.MailboxStatus, account *models.EmailAccount, logger *slog.Logger) {
+	validity := uint32(0)
+	if mbox != nil {
+		validity = mbox.UidValidity
+	}
+
+	reset := ""
+	switch {
+	case account.LastUID == 0:
+		reset = "new account"
+	case account.UIDValidity != 0 && validity != 0 && validity != account.UIDValidity:
+		reset = "UIDVALIDITY changed"
+	case account.UIDValidity == 0 && mbox != nil && mbox.UidNext > 0 && mbox.UidNext-1 < account.LastUID:
+		reset = "UIDs went backwards"
+	}
+
+	if reset == "" {
+		if account.UIDValidity == 0 && validity != 0 {
+			account.UIDValidity = validity
+			m.persistSync(account)
+		}
+		return
+	}
+
+	uid, err := c.HighestUID(mbox)
+	if err != nil {
+		logger.Warn("failed to get highest UID", "error", err)
+		return
+	}
+	account.LastUID = uid
+	account.UIDValidity = validity
+	m.persistSync(account)
+	logger.Info("UID baseline set", "reason", reset, "uid", uid, "uid_validity", validity)
+}
+
+func (m *Manager) persistSync(account *models.EmailAccount) {
+	if m.onSync != nil {
+		m.onSync(account.ID, account.LastUID, account.UIDValidity)
 	}
 }
 
 // serve fetches new mail and waits for changes until an error occurs
-func (m *Manager) serve(ctx context.Context, c *Client, w *clientWrapper, lastUID *uint32) error {
+func (m *Manager) serve(ctx context.Context, c *Client, w *clientWrapper) error {
+	account := w.account
 	for {
+	batches:
 		for {
-			emails, err := c.FetchSince(*lastUID, fetchBatchSize)
+			emails, err := c.FetchSince(account.LastUID, fetchBatchSize)
 			if err != nil {
 				return err
 			}
 			for _, msg := range emails {
 				if m.onMessage != nil {
-					m.onMessage(w.account.ID, msg)
+					if err := m.onMessage(account.ID, msg); err != nil {
+						// Telegram is unavailable: keep the UID, retry on the next check
+						m.logger.Warn("failed to deliver message, will retry",
+							"account_id", account.ID, "uid", msg.UID, "error", err)
+						break batches
+					}
 				}
-				if msg.UID > *lastUID {
-					*lastUID = msg.UID
+				if msg.UID > account.LastUID {
+					account.LastUID = msg.UID
 				}
 			}
 			if len(emails) < fetchBatchSize {

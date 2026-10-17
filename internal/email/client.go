@@ -53,6 +53,9 @@ type ClientConfig struct {
 	TLSConfig    *tls.Config   // nil means default verification against Server
 }
 
+// maxFetchBytes is how much of each message is downloaded
+const maxFetchBytes = 2 << 20
+
 // command is an IMAP operation requested from outside the connection goroutine
 type command struct {
 	fn   func(*client.Client) error
@@ -91,29 +94,10 @@ func (c *Client) Connect(ctx context.Context) (*imap.MailboxStatus, error) {
 
 	c.logger.Debug("connecting to IMAP server", "server", c.config.Server)
 
-	tlsConfig := c.config.TLSConfig
-	if tlsConfig == nil {
-		host, _, _ := net.SplitHostPort(c.config.Server)
-		tlsConfig = &tls.Config{ServerName: host}
-	}
-	dialer := &tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: c.config.DialTimeout, KeepAlive: 30 * time.Second},
-		Config:    tlsConfig,
-	}
-	conn, err := dialer.DialContext(ctx, "tcp", c.config.Server)
+	imapClient, err := c.dial(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
+		return nil, err
 	}
-
-	imapClient, err := client.New(conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create IMAP client: %w", err)
-	}
-
-	// Every command (IDLE included) must finish within this time,
-	// otherwise the connection is considered dead
-	imapClient.Timeout = c.config.PollInterval + 2*time.Minute
 
 	// Unilateral server updates (new mail during IDLE). The channel must be
 	// drained all the time, otherwise the IMAP reader blocks.
@@ -151,6 +135,80 @@ func (c *Client) Connect(ctx context.Context) (*imap.MailboxStatus, error) {
 	c.newMail = newMail
 	c.logger.Info("connected to IMAP server", "server", c.config.Server)
 	return mbox, nil
+}
+
+// dial opens a TLS-protected IMAP connection: implicit TLS (port 993) or
+// STARTTLS (ports 143/1143, or when the port does not speak TLS)
+func (c *Client) dial(ctx context.Context) (*client.Client, error) {
+	host, port, err := net.SplitHostPort(c.config.Server)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server address %q (expected host:port): %w", c.config.Server, err)
+	}
+
+	tlsConfig := c.config.TLSConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{ServerName: host}
+		// Local bridges (Proton Mail Bridge) use self-signed certificates
+		if isLoopback(host) {
+			tlsConfig.InsecureSkipVerify = true
+		}
+	}
+	netDialer := &net.Dialer{Timeout: c.config.DialTimeout, KeepAlive: 30 * time.Second}
+
+	if port != "143" && port != "1143" {
+		tlsDialer := &tls.Dialer{NetDialer: netDialer, Config: tlsConfig}
+		conn, err := tlsDialer.DialContext(ctx, "tcp", c.config.Server)
+		if err == nil {
+			imapClient, err := client.New(conn)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to create IMAP client: %w", err)
+			}
+			imapClient.Timeout = c.commandTimeout()
+			return imapClient, nil
+		}
+		var recordErr tls.RecordHeaderError
+		if !errors.As(err, &recordErr) {
+			return nil, fmt.Errorf("failed to connect: %w", err)
+		}
+		// The server answered in plain text: try STARTTLS on the same port
+		c.logger.Debug("server does not speak implicit TLS, trying STARTTLS")
+	}
+
+	conn, err := netDialer.DialContext(ctx, "tcp", c.config.Server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+	conn.SetDeadline(time.Now().Add(c.config.DialTimeout))
+	imapClient, err := client.New(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create IMAP client: %w", err)
+	}
+	imapClient.Timeout = c.commandTimeout()
+	if ok, _ := imapClient.SupportStartTLS(); !ok {
+		imapClient.Terminate()
+		return nil, errors.New("server supports neither TLS nor STARTTLS, refusing to send the password in plain text")
+	}
+	if err := imapClient.StartTLS(tlsConfig); err != nil {
+		imapClient.Terminate()
+		return nil, fmt.Errorf("STARTTLS failed: %w", err)
+	}
+	return imapClient, nil
+}
+
+// commandTimeout is the maximum duration of any IMAP command, IDLE included.
+// A command that takes longer means the connection is dead.
+func (c *Client) commandTimeout() time.Duration {
+	return c.config.PollInterval + 2*time.Minute
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Close logs out and closes the connection
@@ -229,8 +287,10 @@ func (c *Client) FetchSince(sinceUID uint32, limit int) ([]*RawEmail, error) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uids...)
 
-	// PEEK so that forwarding does not mark mail as read on the server
-	section := &imap.BodySectionName{Peek: true}
+	// PEEK so that forwarding does not mark mail as read on the server.
+	// Only the beginning of the message is fetched: text parts come first,
+	// attachments after them must not be loaded into memory.
+	section := &imap.BodySectionName{Peek: true, Partial: []int{0, maxFetchBytes}}
 	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, section.FetchItem()}
 
 	messages := make(chan *imap.Message, len(uids))
@@ -305,7 +365,8 @@ func (c *Client) parseMessage(msg *imap.Message, section *imap.BodySectionName) 
 		}
 		ct, _, _ := h.ContentType()
 		body, err := io.ReadAll(part.Body)
-		if err != nil {
+		if err != nil && len(body) == 0 {
+			// Part cut off by the partial fetch or broken encoding
 			continue
 		}
 
@@ -403,17 +464,73 @@ func markAsRead(cl *client.Client, uid uint32) error {
 	return nil
 }
 
-// deleteMessage adds the \Deleted flag and expunges
+// deleteMessage removes one message from INBOX. It moves the message to Trash
+// when possible. Otherwise it flags it \Deleted and expunges only this UID:
+// a plain EXPUNGE would also wipe other messages flagged by mail clients.
 func deleteMessage(cl *client.Client, uid uint32) error {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
+
+	trash := findTrash(cl)
+	if trash != "" {
+		if ok, _ := cl.Support("MOVE"); ok {
+			if err := cl.UidMove(seqSet, trash); err == nil {
+				return nil
+			}
+		}
+		// No MOVE: copy to Trash, then remove from INBOX below
+		if err := cl.UidCopy(seqSet, trash); err != nil {
+			return fmt.Errorf("failed to copy to %s: %w", trash, err)
+		}
+	}
 
 	item := imap.FormatFlagsOp(imap.AddFlags, true)
 	if err := cl.UidStore(seqSet, item, []interface{}{imap.DeletedFlag}, nil); err != nil {
 		return fmt.Errorf("failed to mark as deleted: %w", err)
 	}
-	if err := cl.Expunge(nil); err != nil {
-		return fmt.Errorf("failed to expunge: %w", err)
+
+	if ok, _ := cl.Support("UIDPLUS"); ok {
+		cmd := &imap.Command{Name: "UID", Arguments: []interface{}{imap.RawString("EXPUNGE"), seqSet}}
+		status, err := cl.Execute(cmd, nil)
+		if err == nil {
+			err = status.Err()
+		}
+		if err != nil {
+			return fmt.Errorf("failed to expunge: %w", err)
+		}
 	}
+	// Without UIDPLUS the message stays flagged \Deleted and is removed
+	// by the server or the next mail client that expunges
 	return nil
+}
+
+// findTrash returns the name of the Trash mailbox, or "" if there is none
+func findTrash(cl *client.Client) string {
+	mailboxes := make(chan *imap.MailboxInfo, 32)
+	done := make(chan error, 1)
+	go func() {
+		done <- cl.List("", "*", mailboxes)
+	}()
+
+	var byAttr, byName string
+	for m := range mailboxes {
+		for _, attr := range m.Attributes {
+			if strings.EqualFold(attr, imap.TrashAttr) && byAttr == "" {
+				byAttr = m.Name
+			}
+		}
+		switch strings.ToLower(m.Name) {
+		case "trash", "deleted items", "deleted messages", "корзина", "удаленные", "удалённые":
+			if byName == "" {
+				byName = m.Name
+			}
+		}
+	}
+	if err := <-done; err != nil {
+		return ""
+	}
+	if byAttr != "" {
+		return byAttr
+	}
+	return byName
 }
