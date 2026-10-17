@@ -7,7 +7,7 @@ require (
 	github.com/caarlos0/env/v11 v11.3.1
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-message v0.18.2
-	github.com/go-telegram/bot v1.17.0
+	github.com/go-telegram/bot v1.27.0
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/joho/godotenv v1.5.1
 	github.com/lmittmann/tint v1.0.6

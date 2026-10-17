@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -14,24 +15,28 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-// isUserAdmin checks if a user is an admin in the chat
-func (b *Bot) isUserAdmin(ctx context.Context, chatID, userID int64) (bool, error) {
+// isUserAdmin checks if the sender of a message is an admin in the chat
+func (b *Bot) isUserAdmin(ctx context.Context, msg *models.Message) (bool, error) {
+	// Anonymous admin: the message is sent on behalf of the group itself
+	if msg.SenderChat != nil && msg.SenderChat.ID == msg.Chat.ID {
+		return true, nil
+	}
+	if msg.From == nil {
+		return false, nil
+	}
+
 	// Use separate context with timeout to avoid blocking
 	apiCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	b.logger.Info("calling GetChatMember API", "chat_id", chatID, "user_id", userID)
 	member, err := b.bot.GetChatMember(apiCtx, &bot.GetChatMemberParams{
-		ChatID: chatID,
-		UserID: userID,
+		ChatID: msg.Chat.ID,
+		UserID: msg.From.ID,
 	})
-	b.logger.Info("GetChatMember returned", "error", err)
 	if err != nil {
 		return false, err
 	}
 
-	b.logger.Info("member type", "type", member.Type)
-	// Check member type
 	switch member.Type {
 	case models.ChatMemberTypeOwner, models.ChatMemberTypeAdministrator:
 		return true, nil
@@ -40,35 +45,103 @@ func (b *Bot) isUserAdmin(ctx context.Context, chatID, userID int64) (bool, erro
 	}
 }
 
+// requireAdmin replies with an error and returns false if the sender is not an admin
+func (b *Bot) requireAdmin(ctx context.Context, msg *models.Message, deniedText string) bool {
+	isAdmin, err := b.isUserAdmin(ctx, msg)
+	if err != nil {
+		b.logger.Error("failed to check admin status", "error", err)
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Ошибка проверки прав")
+		return false
+	}
+	if !isAdmin {
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, deniedText)
+		return false
+	}
+	return true
+}
+
+// senderID returns the ID of the user (or anonymous group) who sent the message
+func senderID(msg *models.Message) int64 {
+	if msg.From != nil {
+		return msg.From.ID
+	}
+	if msg.SenderChat != nil {
+		return msg.SenderChat.ID
+	}
+	return 0
+}
+
+// requireForum replies with an error and returns false if the chat is not a supergroup with topics
+func (b *Bot) requireForum(ctx context.Context, msg *models.Message) bool {
+	if msg.Chat.Type != models.ChatTypeSupergroup {
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Эта команда работает только в супергруппах")
+		return false
+	}
+	if !msg.Chat.IsForum {
+		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Эта команда работает только в супергруппах с топиками")
+		return false
+	}
+	return true
+}
+
 // sendMessage sends a message to a topic
 func (b *Bot) sendMessage(ctx context.Context, chatID int64, topicID int, text string) (*models.Message, error) {
-	params := &bot.SendMessageParams{
-		ChatID:    chatID,
-		Text:      text,
-		ParseMode: models.ParseModeHTML,
-	}
-
-	if topicID != 0 {
-		params.MessageThreadID = topicID
-	}
-
-	return b.bot.SendMessage(ctx, params)
+	return b.sendMessageWithKeyboard(ctx, chatID, topicID, text, nil)
 }
 
 // sendMessageWithKeyboard sends a message with inline keyboard
 func (b *Bot) sendMessageWithKeyboard(ctx context.Context, chatID int64, topicID int, text string, keyboard *models.InlineKeyboardMarkup) (*models.Message, error) {
 	params := &bot.SendMessageParams{
-		ChatID:      chatID,
-		Text:        text,
-		ParseMode:   models.ParseModeHTML,
-		ReplyMarkup: keyboard,
+		ChatID:          chatID,
+		MessageThreadID: topicID,
+		Text:            text,
+		ParseMode:       models.ParseModeHTML,
+		LinkPreviewOptions: &models.LinkPreviewOptions{
+			IsDisabled: bot.True(),
+		},
+	}
+	if keyboard != nil {
+		params.ReplyMarkup = keyboard
 	}
 
-	if topicID != 0 {
-		params.MessageThreadID = topicID
+	var sent *models.Message
+	err := withRetry(ctx, func() error {
+		var err error
+		sent, err = b.bot.SendMessage(ctx, params)
+		return err
+	})
+	if err != nil {
+		b.logger.Error("failed to send message", "chat_id", chatID, "topic_id", topicID, "error", err)
 	}
+	return sent, err
+}
 
-	return b.bot.SendMessage(ctx, params)
+// editMessageText replaces the text of a message
+func (b *Bot) editMessageText(ctx context.Context, chatID int64, msgID int, text string) error {
+	_, err := b.bot.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    chatID,
+		MessageID: msgID,
+		Text:      text,
+		ParseMode: models.ParseModeHTML,
+	})
+	return err
+}
+
+// withRetry retries fn when Telegram answers 429 Too Many Requests
+func withRetry(ctx context.Context, fn func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := fn()
+		var tooMany *bot.TooManyRequestsError
+		if err == nil || !errors.As(err, &tooMany) || attempt >= 5 {
+			return err
+		}
+		wait := time.Duration(tooMany.RetryAfter+1) * time.Second
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+	}
 }
 
 // deleteMessage deletes a message

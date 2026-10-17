@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
+	"strings"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -56,6 +58,10 @@ func NewBot(deps BotDeps) (*Bot, error) {
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(b.defaultHandler),
+		bot.WithMiddlewares(b.recoverMiddleware),
+		bot.WithErrorsHandler(func(err error) {
+			b.logger.Warn("telegram polling error", "error", err)
+		}),
 	}
 
 	tgBot, err := bot.New(deps.Config.TelegramToken, opts...)
@@ -71,13 +77,40 @@ func NewBot(deps BotDeps) (*Bot, error) {
 
 // registerHandlers registers command handlers
 func (b *Bot) registerHandlers() {
-	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/connect", bot.MatchTypePrefix, b.handleConnect)
-	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/create", bot.MatchTypePrefix, b.handleCreate)
-	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/disconnect", bot.MatchTypePrefix, b.handleDisconnect)
-	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/status", bot.MatchTypePrefix, b.handleStatus)
-	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypePrefix, b.handleStart)
-	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/help", bot.MatchTypePrefix, b.handleHelp)
+	b.bot.RegisterHandlerMatchFunc(matchCommand("connect"), b.handleConnect)
+	b.bot.RegisterHandlerMatchFunc(matchCommand("create"), b.handleCreate)
+	b.bot.RegisterHandlerMatchFunc(matchCommand("disconnect"), b.handleDisconnect)
+	b.bot.RegisterHandlerMatchFunc(matchCommand("status"), b.handleStatus)
+	b.bot.RegisterHandlerMatchFunc(matchCommand("start"), b.handleStart)
+	b.bot.RegisterHandlerMatchFunc(matchCommand("help"), b.handleHelp)
 	b.bot.RegisterHandler(bot.HandlerTypeCallbackQueryData, "", bot.MatchTypePrefix, b.handleCallback)
+}
+
+// matchCommand matches "/name", "/name@botname" and "/name args"
+func matchCommand(name string) bot.MatchFunc {
+	return func(update *models.Update) bool {
+		if update.Message == nil {
+			return false
+		}
+		fields := strings.Fields(update.Message.Text)
+		if len(fields) == 0 {
+			return false
+		}
+		cmd, _, _ := strings.Cut(fields[0], "@")
+		return strings.EqualFold(cmd, "/"+name)
+	}
+}
+
+// recoverMiddleware keeps a panic in one handler from crashing the whole bot
+func (b *Bot) recoverMiddleware(next bot.HandlerFunc) bot.HandlerFunc {
+	return func(ctx context.Context, tgBot *bot.Bot, update *models.Update) {
+		defer func() {
+			if r := recover(); r != nil {
+				b.logger.Error("panic in update handler", "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		next(ctx, tgBot, update)
+	}
 }
 
 // Start starts the bot

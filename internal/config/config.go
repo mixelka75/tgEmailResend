@@ -22,7 +22,7 @@ type Config struct {
 	EmailPollInterval time.Duration `env:"EMAIL_POLL_INTERVAL" envDefault:"1m"`
 
 	// Mailcow integration (optional)
-	MailcowURL    string `env:"MAILCOW_URL"`    // e.g., https://mail.example.com
+	MailcowURL    string `env:"MAILCOW_URL"` // e.g., https://mail.example.com
 	MailcowAPIKey string `env:"MAILCOW_API_KEY"`
 	MailcowDomain string `env:"MAILCOW_DOMAIN"` // e.g., example.com
 

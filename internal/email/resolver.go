@@ -3,39 +3,57 @@ package email
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Common IMAP servers for popular email providers
 var knownIMAPServers = map[string]string{
-	"gmail.com":       "imap.gmail.com:993",
-	"googlemail.com":  "imap.gmail.com:993",
-	"outlook.com":     "outlook.office365.com:993",
-	"hotmail.com":     "outlook.office365.com:993",
-	"live.com":        "outlook.office365.com:993",
-	"msn.com":         "outlook.office365.com:993",
-	"yahoo.com":       "imap.mail.yahoo.com:993",
-	"yahoo.co.uk":     "imap.mail.yahoo.com:993",
-	"yandex.ru":       "imap.yandex.ru:993",
-	"yandex.com":      "imap.yandex.com:993",
-	"mail.ru":         "imap.mail.ru:993",
-	"bk.ru":           "imap.mail.ru:993",
-	"list.ru":         "imap.mail.ru:993",
-	"inbox.ru":        "imap.mail.ru:993",
-	"icloud.com":      "imap.mail.me.com:993",
-	"me.com":          "imap.mail.me.com:993",
-	"mac.com":         "imap.mail.me.com:993",
-	"aol.com":         "imap.aol.com:993",
-	"zoho.com":        "imap.zoho.com:993",
-	"protonmail.com":  "127.0.0.1:1143", // ProtonMail Bridge
-	"proton.me":       "127.0.0.1:1143",
-	"fastmail.com":    "imap.fastmail.com:993",
-	"gmx.com":         "imap.gmx.com:993",
-	"gmx.de":          "imap.gmx.net:993",
-	"web.de":          "imap.web.de:993",
-	"t-online.de":     "secureimap.t-online.de:993",
-	"rambler.ru":      "imap.rambler.ru:993",
+	"gmail.com":      "imap.gmail.com:993",
+	"googlemail.com": "imap.gmail.com:993",
+	"outlook.com":    "outlook.office365.com:993",
+	"hotmail.com":    "outlook.office365.com:993",
+	"live.com":       "outlook.office365.com:993",
+	"msn.com":        "outlook.office365.com:993",
+	"yahoo.com":      "imap.mail.yahoo.com:993",
+	"yahoo.co.uk":    "imap.mail.yahoo.com:993",
+	"yandex.ru":      "imap.yandex.ru:993",
+	"yandex.com":     "imap.yandex.com:993",
+	"mail.ru":        "imap.mail.ru:993",
+	"bk.ru":          "imap.mail.ru:993",
+	"list.ru":        "imap.mail.ru:993",
+	"inbox.ru":       "imap.mail.ru:993",
+	"icloud.com":     "imap.mail.me.com:993",
+	"me.com":         "imap.mail.me.com:993",
+	"mac.com":        "imap.mail.me.com:993",
+	"aol.com":        "imap.aol.com:993",
+	"zoho.com":       "imap.zoho.com:993",
+	"protonmail.com": "127.0.0.1:1143", // ProtonMail Bridge
+	"proton.me":      "127.0.0.1:1143",
+	"fastmail.com":   "imap.fastmail.com:993",
+	"gmx.com":        "imap.gmx.com:993",
+	"gmx.de":         "imap.gmx.net:993",
+	"web.de":         "imap.web.de:993",
+	"t-online.de":    "secureimap.t-online.de:993",
+	"rambler.ru":     "imap.rambler.ru:993",
+}
+
+// IMAP servers of hosting providers, matched by MX host suffix (custom domains)
+var knownMXProviders = []struct {
+	mxSuffix string
+	server   string
+}{
+	{"google.com", "imap.gmail.com:993"},
+	{"googlemail.com", "imap.gmail.com:993"},
+	{"outlook.com", "outlook.office365.com:993"},
+	{"yandex.net", "imap.yandex.ru:993"},
+	{"yandex.ru", "imap.yandex.ru:993"},
+	{"mail.ru", "imap.mail.ru:993"},
+	{"zoho.com", "imap.zoho.com:993"},
+	{"zoho.eu", "imap.zoho.eu:993"},
+	{"messagingengine.com", "imap.fastmail.com:993"},
+	{"icloud.com", "imap.mail.me.com:993"},
 }
 
 // ResolveIMAPServer determines the IMAP server for an email address
@@ -49,6 +67,11 @@ func ResolveIMAPServer(email string) (string, error) {
 
 	// Check known providers first
 	if server, ok := knownIMAPServers[domain]; ok {
+		return server, nil
+	}
+
+	// Custom domain hosted by a known provider
+	if server := resolveViaKnownMX(domain); server != "" {
 		return server, nil
 	}
 
@@ -78,13 +101,30 @@ func ResolveIMAPServer(email string) (string, error) {
 
 // checkIMAPServer checks if an IMAP server is reachable
 func checkIMAPServer(host string, port int) bool {
-	address := fmt.Sprintf("%s:%d", host, port)
+	address := net.JoinHostPort(host, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
 	if err != nil {
 		return false
 	}
 	conn.Close()
 	return true
+}
+
+// resolveViaKnownMX returns the IMAP server if the domain's MX belongs to a known provider
+func resolveViaKnownMX(domain string) string {
+	mxRecords, err := net.LookupMX(domain)
+	if err != nil {
+		return ""
+	}
+	for _, mx := range mxRecords {
+		host := strings.ToLower(strings.TrimSuffix(mx.Host, "."))
+		for _, p := range knownMXProviders {
+			if host == p.mxSuffix || strings.HasSuffix(host, "."+p.mxSuffix) {
+				return p.server
+			}
+		}
+	}
+	return ""
 }
 
 // resolveViaMX tries to determine IMAP server from MX records

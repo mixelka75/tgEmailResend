@@ -9,21 +9,21 @@ import (
 
 // HTMLParser parses HTML emails to plain text
 type HTMLParser struct {
-	whitespaceRegex  *regexp.Regexp
-	newlineRegex     *regexp.Regexp
-	invisibleRegex   *regexp.Regexp
-	emptyLineRegex   *regexp.Regexp
+	whitespaceRegex *regexp.Regexp
+	newlineRegex    *regexp.Regexp
+	invisibleRegex  *regexp.Regexp
+	emptyLineRegex  *regexp.Regexp
 }
 
 // NewHTMLParser creates a new HTML parser
 func NewHTMLParser() *HTMLParser {
 	return &HTMLParser{
-		whitespaceRegex:  regexp.MustCompile(`[^\S\n]+`),
-		newlineRegex:     regexp.MustCompile(`\n{3,}`),
+		whitespaceRegex: regexp.MustCompile(`[^\S\n]+`),
+		newlineRegex:    regexp.MustCompile(`\n{3,}`),
 		// Remove invisible Unicode characters (zero-width spaces, etc.)
-		invisibleRegex:   regexp.MustCompile(`[\x{200B}-\x{200D}\x{FEFF}\x{00AD}\x{034F}\x{061C}\x{115F}\x{1160}\x{17B4}\x{17B5}\x{180E}\x{2060}-\x{2064}\x{206A}-\x{206F}\x{FE00}-\x{FE0F}\x{FFF0}-\x{FFF8}]+`),
+		invisibleRegex: regexp.MustCompile(`[\x{200B}-\x{200D}\x{FEFF}\x{00AD}\x{034F}\x{061C}\x{115F}\x{1160}\x{17B4}\x{17B5}\x{180E}\x{2060}-\x{2064}\x{206A}-\x{206F}\x{FE00}-\x{FE0F}\x{FFF0}-\x{FFF8}]+`),
 		// Remove lines that only contain whitespace or invisible chars
-		emptyLineRegex:   regexp.MustCompile(`(?m)^\s*$`),
+		emptyLineRegex: regexp.MustCompile(`(?m)^\s*$`),
 	}
 }
 

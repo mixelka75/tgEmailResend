@@ -2,8 +2,10 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/go-telegram/bot"
@@ -20,27 +22,8 @@ import (
 func (b *Bot) handleConnect(ctx context.Context, tgBot *bot.Bot, update *models.Update) {
 	msg := update.Message
 
-	// Check if it's a supergroup with topics
-	if msg.Chat.Type != "supergroup" {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Эта команда работает только в супергруппах")
-		return
-	}
-
-	if !msg.Chat.IsForum {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Эта команда работает только в супергруппах с топиками")
-		return
-	}
-
-	// Check if user is admin
-	isAdmin, err := b.isUserAdmin(ctx, msg.Chat.ID, msg.From.ID)
-	if err != nil {
-		b.logger.Error("failed to check admin status", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Ошибка проверки прав")
-		return
-	}
-
-	if !isAdmin {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Только администраторы могут подключать почтовые аккаунты")
+	if !b.requireForum(ctx, msg) ||
+		!b.requireAdmin(ctx, msg, "Только администраторы могут подключать почтовые аккаунты") {
 		return
 	}
 
@@ -52,7 +35,7 @@ func (b *Bot) handleConnect(ctx context.Context, tgBot *bot.Bot, update *models.
 		return
 	}
 
-	emailAddr := parts[1]
+	emailAddr := strings.ToLower(parts[1])
 	password := parts[2]
 	topicID := msg.MessageThreadID
 
@@ -61,23 +44,9 @@ func (b *Bot) handleConnect(ctx context.Context, tgBot *bot.Bot, update *models.
 		b.logger.Warn("failed to delete connect message", "error", err)
 	}
 
-	// Determine IMAP server
-	var imapServer string
-	if len(parts) == 4 {
-		// User specified server
-		imapServer = parts[3]
-	} else {
-		// Auto-detect
-		b.sendMessage(ctx, msg.Chat.ID, topicID, "Определяю IMAP сервер...")
-		var err error
-		imapServer, err = email.ResolveIMAPServer(emailAddr)
-		if err != nil {
-			b.logger.Error("failed to resolve IMAP server", "error", err)
-			b.sendMessage(ctx, msg.Chat.ID, topicID,
-				fmt.Sprintf("Не удалось определить IMAP сервер для %s\nПопробуйте указать вручную: <code>/connect email password imap.server.com:993</code>", emailAddr))
-			return
-		}
-		b.logger.Info("resolved IMAP server", "email", emailAddr, "server", imapServer)
+	if email.GetDomainFromEmail(emailAddr) == "" {
+		b.sendMessage(ctx, msg.Chat.ID, topicID, "Некорректный email: "+escape(emailAddr))
+		return
 	}
 
 	// Check if topic already has an account
@@ -87,57 +56,89 @@ func (b *Bot) handleConnect(ctx context.Context, tgBot *bot.Bot, update *models.
 		b.sendMessage(ctx, msg.Chat.ID, topicID, "Ошибка проверки существующего подключения")
 		return
 	}
-
 	if existing != nil {
 		b.sendMessage(ctx, msg.Chat.ID, topicID,
-			fmt.Sprintf("В этом топике уже подключена почта: %s\nИспользуйте /disconnect для отключения", existing.Email))
+			fmt.Sprintf("В этом топике уже подключена почта: %s\nИспользуйте /disconnect для отключения", escape(existing.Email)))
 		return
+	}
+
+	// One status message, updated as we go
+	status := newStatusMessage(ctx, b, msg.Chat.ID, topicID)
+
+	// Determine IMAP server
+	var imapServer string
+	if len(parts) == 4 {
+		imapServer = parts[3]
+		if !strings.Contains(imapServer, ":") {
+			imapServer += ":993"
+		}
+	} else {
+		status.set("Определяю IMAP сервер...")
+		imapServer, err = email.ResolveIMAPServer(emailAddr)
+		if err != nil {
+			b.logger.Error("failed to resolve IMAP server", "error", err)
+			status.set(fmt.Sprintf("Не удалось определить IMAP сервер для %s\nПопробуйте указать вручную: <code>/connect email password imap.server.com:993</code>", escape(emailAddr)))
+			return
+		}
+		b.logger.Info("resolved IMAP server", "email", emailAddr, "server", imapServer)
 	}
 
 	// Test connection
-	b.sendMessage(ctx, msg.Chat.ID, topicID, fmt.Sprintf("Проверяю подключение к %s...", imapServer))
+	status.set(fmt.Sprintf("Проверяю подключение к %s...", escape(imapServer)))
 
 	if err := b.emailManager.TestConnection(ctx, emailAddr, password, imapServer); err != nil {
-		b.logger.Error("connection test failed", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, fmt.Sprintf("Ошибка подключения: %v", err))
+		b.logger.Error("connection test failed", "email", emailAddr, "server", imapServer, "error", err)
+		status.set(fmt.Sprintf("Ошибка подключения к %s:\n<code>%s</code>\n\nПроверьте пароль (для Gmail/Yandex/Mail.ru нужен пароль приложения) или укажите сервер вручную: <code>/connect email password imap.server.com:993</code>",
+			escape(imapServer), escape(err.Error())))
 		return
 	}
 
-	// Encrypt password
+	if b.saveAndStartAccount(ctx, status, emailAddr, password, imapServer, msg) == nil {
+		return
+	}
+
+	status.set(fmt.Sprintf("Почта <b>%s</b> успешно подключена к этому топику!\nСервер: %s\n\nНовые письма будут автоматически пересылаться сюда.",
+		escape(emailAddr), escape(imapServer)))
+}
+
+// saveAndStartAccount stores the account and starts its email client.
+// On failure it reports to the status message and returns nil.
+func (b *Bot) saveAndStartAccount(ctx context.Context, status *statusMessage, emailAddr, password, imapServer string, msg *models.Message) *appmodels.EmailAccount {
 	encryptedPassword, err := b.encryptPassword(password)
 	if err != nil {
 		b.logger.Error("failed to encrypt password", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, "Ошибка шифрования пароля")
-		return
+		status.set("Ошибка шифрования пароля")
+		return nil
 	}
 
-	// Create account
 	account := &appmodels.EmailAccount{
 		Email:      emailAddr,
 		Password:   encryptedPassword,
 		IMAPServer: imapServer,
 		ChatID:     msg.Chat.ID,
-		TopicID:    topicID,
+		TopicID:    msg.MessageThreadID,
 		IsActive:   true,
-		CreatedBy:  msg.From.ID,
+		CreatedBy:  senderID(msg),
 	}
 
 	if err := b.db.CreateAccount(ctx, account); err != nil {
+		if errors.Is(err, database.ErrAlreadyExists) {
+			status.set(fmt.Sprintf("Почта <b>%s</b> уже подключена к другому топику этой группы. Сначала выполните там /disconnect", escape(emailAddr)))
+			return nil
+		}
 		b.logger.Error("failed to create account", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, "Ошибка сохранения аккаунта в базу данных")
-		return
+		status.set("Ошибка сохранения аккаунта в базу данных")
+		return nil
 	}
 
-	// Start email client
 	if err := b.emailManager.AddAccount(ctx, account); err != nil {
 		b.logger.Error("failed to start email client", "error", err)
 		b.db.DeleteAccount(ctx, account.ID)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, fmt.Sprintf("Ошибка запуска подключения: %v", err))
-		return
+		status.set(fmt.Sprintf("Ошибка запуска подключения: %s", escape(err.Error())))
+		return nil
 	}
 
-	b.sendMessage(ctx, msg.Chat.ID, topicID,
-		fmt.Sprintf("Почта <b>%s</b> успешно подключена к этому топику!\nСервер: %s\n\nНовые письма будут автоматически пересылаться сюда.", emailAddr, imapServer))
+	return account
 }
 
 // handleCreate handles /create command for Mailcow mailbox creation
@@ -151,27 +152,8 @@ func (b *Bot) handleCreate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
-	// Check if it's a supergroup with topics
-	if msg.Chat.Type != "supergroup" {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Эта команда работает только в супергруппах")
-		return
-	}
-
-	if !msg.Chat.IsForum {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Эта команда работает только в супергруппах с топиками")
-		return
-	}
-
-	// Check if user is admin
-	isAdmin, err := b.isUserAdmin(ctx, msg.Chat.ID, msg.From.ID)
-	if err != nil {
-		b.logger.Error("failed to check admin status", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Ошибка проверки прав")
-		return
-	}
-
-	if !isAdmin {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Только администраторы могут создавать почтовые ящики")
+	if !b.requireForum(ctx, msg) ||
+		!b.requireAdmin(ctx, msg, "Только администраторы могут создавать почтовые ящики") {
 		return
 	}
 
@@ -180,11 +162,11 @@ func (b *Bot) handleCreate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	if len(parts) < 2 {
 		domain := b.mailcow.GetDomain()
 		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID,
-			fmt.Sprintf("Использование: <code>/create username</code>\nИли: <code>/create username password</code>\nИли: <code>/create username password Имя</code>\n\nБудет создан ящик: username@%s", domain))
+			fmt.Sprintf("Использование: <code>/create username</code>\nИли: <code>/create username password</code>\nИли: <code>/create username password Имя</code>\n\nБудет создан ящик: username@%s", escape(domain)))
 		return
 	}
 
-	localPart := parts[1]
+	localPart := strings.ToLower(parts[1])
 	password := ""
 	name := localPart
 
@@ -211,89 +193,50 @@ func (b *Bot) handleCreate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		b.sendMessage(ctx, msg.Chat.ID, topicID, "Ошибка проверки существующего подключения")
 		return
 	}
-
 	if existing != nil {
 		b.sendMessage(ctx, msg.Chat.ID, topicID,
-			fmt.Sprintf("В этом топике уже подключена почта: %s\nИспользуйте /disconnect для отключения", existing.Email))
+			fmt.Sprintf("В этом топике уже подключена почта: %s\nИспользуйте /disconnect для отключения", escape(existing.Email)))
 		return
 	}
 
-	// Create mailbox in Mailcow
-	b.sendMessage(ctx, msg.Chat.ID, topicID, "Создаю почтовый ящик...")
+	status := newStatusMessage(ctx, b, msg.Chat.ID, topicID)
+	status.set("Создаю почтовый ящик...")
 
 	mailbox, err := b.mailcow.CreateMailbox(ctx, localPart, name, password, 1024)
 	if err != nil {
 		b.logger.Error("failed to create mailbox", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, fmt.Sprintf("Ошибка создания почтового ящика: %v", err))
+		status.set(fmt.Sprintf("Ошибка создания почтового ящика: %s", escape(err.Error())))
 		return
 	}
 
 	emailAddr := mailbox.LocalPart + "@" + mailbox.Domain
 	imapServer := b.mailcow.GetIMAPServer()
 
-	// Encrypt password
-	encryptedPassword, err := b.encryptPassword(mailbox.Password)
-	if err != nil {
-		b.logger.Error("failed to encrypt password", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, "Ошибка шифрования пароля")
+	if b.saveAndStartAccount(ctx, status, emailAddr, mailbox.Password, imapServer, msg) == nil {
 		return
 	}
 
-	// Create account in database
-	account := &appmodels.EmailAccount{
-		Email:      emailAddr,
-		Password:   encryptedPassword,
-		IMAPServer: imapServer,
-		ChatID:     msg.Chat.ID,
-		TopicID:    topicID,
-		IsActive:   true,
-		CreatedBy:  msg.From.ID,
-	}
-
-	if err := b.db.CreateAccount(ctx, account); err != nil {
-		b.logger.Error("failed to create account", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, "Ошибка сохранения аккаунта в базу данных")
-		return
-	}
-
-	// Start email client
-	if err := b.emailManager.AddAccount(ctx, account); err != nil {
-		b.logger.Error("failed to start email client", "error", err)
-		b.db.DeleteAccount(ctx, account.ID)
-		b.sendMessage(ctx, msg.Chat.ID, topicID, fmt.Sprintf("Ошибка запуска подключения: %v", err))
-		return
-	}
-
-	// Send success message with credentials
-	credentialsMsg := fmt.Sprintf(
+	host, _, _ := strings.Cut(imapServer, ":")
+	status.set(fmt.Sprintf(
 		"Почтовый ящик успешно создан!\n\n"+
 			"<b>Email:</b> <code>%s</code>\n"+
 			"<b>Пароль:</b> <code>%s</code>\n"+
 			"<b>IMAP:</b> %s\n"+
-			"<b>SMTP:</b> %s\n\n"+
+			"<b>SMTP:</b> %s:587\n\n"+
 			"Новые письма будут автоматически пересылаться в этот топик.",
-		emailAddr,
-		mailbox.Password,
-		imapServer,
-		strings.Replace(imapServer, ":993", ":587", 1),
-	)
-	b.sendMessage(ctx, msg.Chat.ID, topicID, credentialsMsg)
+		escape(emailAddr),
+		escape(mailbox.Password),
+		escape(imapServer),
+		escape(host),
+	))
 }
 
 // handleDisconnect handles /disconnect command
 func (b *Bot) handleDisconnect(ctx context.Context, tgBot *bot.Bot, update *models.Update) {
 	msg := update.Message
 
-	// Check if user is admin
-	isAdmin, err := b.isUserAdmin(ctx, msg.Chat.ID, msg.From.ID)
-	if err != nil {
-		b.logger.Error("failed to check admin status", "error", err)
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Ошибка проверки прав")
-		return
-	}
-
-	if !isAdmin {
-		b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, "Только администраторы могут отключать почтовые аккаунты")
+	if !b.requireForum(ctx, msg) ||
+		!b.requireAdmin(ctx, msg, "Только администраторы могут отключать почтовые аккаунты") {
 		return
 	}
 
@@ -325,7 +268,7 @@ func (b *Bot) handleDisconnect(ctx context.Context, tgBot *bot.Bot, update *mode
 
 	b.logger.Info("email disconnected", "email", account.Email, "chat_id", msg.Chat.ID, "topic_id", topicID)
 	b.sendMessage(ctx, msg.Chat.ID, topicID,
-		fmt.Sprintf("Почта <b>%s</b> отключена от этого топика", account.Email))
+		fmt.Sprintf("Почта <b>%s</b> отключена от этого топика", escape(account.Email)))
 }
 
 // handleStatus handles /status command
@@ -349,17 +292,18 @@ func (b *Bot) handleStatus(ctx context.Context, tgBot *bot.Bot, update *models.U
 	sb.WriteString("<b>Подключенные почтовые аккаунты:</b>\n\n")
 
 	for _, acc := range accounts {
-		status := b.emailManager.GetStatus(acc.ID)
-		statusEmoji := "🔴"
-		if status == "connected" {
-			statusEmoji = "🟢"
-		} else if status == "reconnecting" {
-			statusEmoji = "🟡"
+		statusEmoji, statusText := "🔴", "отключена"
+		switch b.emailManager.GetStatus(acc.ID) {
+		case email.StatusConnected:
+			statusEmoji, statusText = "🟢", "подключена"
+		case email.StatusReconnecting:
+			statusEmoji, statusText = "🟡", "переподключение"
 		}
 
-		sb.WriteString(fmt.Sprintf("%s <b>%s</b>\n", statusEmoji, acc.Email))
+		sb.WriteString(fmt.Sprintf("%s <b>%s</b>\n", statusEmoji, escape(acc.Email)))
 		sb.WriteString(fmt.Sprintf("   Топик ID: %d\n", acc.TopicID))
-		sb.WriteString(fmt.Sprintf("   Статус: %s\n\n", status))
+		sb.WriteString(fmt.Sprintf("   Сервер: %s\n", escape(acc.IMAPServer)))
+		sb.WriteString(fmt.Sprintf("   Статус: %s\n\n", statusText))
 	}
 
 	b.sendMessage(ctx, msg.Chat.ID, msg.MessageThreadID, sb.String())
@@ -424,11 +368,14 @@ func (b *Bot) handleMarkRead(ctx context.Context, callback *models.CallbackQuery
 	// Update keyboard
 	var codes []appmodels.DetectedCode
 	if msg.DetectedCodes != "" {
-		// Parse codes (simplified, assuming JSON)
-		// In real implementation, unmarshal JSON
+		if err := json.Unmarshal([]byte(msg.DetectedCodes), &codes); err != nil {
+			b.logger.Warn("failed to parse detected codes", "error", err, "message_id", msg.ID)
+		}
 	}
 	keyboard := formatter.BuildEmailKeyboard(msg.ID, codes, true)
-	b.editMessageReplyMarkup(ctx, account.ChatID, msg.TelegramMsgID, keyboard)
+	if err := b.editMessageReplyMarkup(ctx, account.ChatID, msg.TelegramMsgID, keyboard); err != nil {
+		b.logger.Warn("failed to update keyboard", "error", err)
+	}
 
 	b.answerCallback(ctx, callback.ID, "Помечено как прочитанное", false)
 }
@@ -464,7 +411,9 @@ func (b *Bot) handleDelete(ctx context.Context, callback *models.CallbackQuery, 
 	}
 
 	// Delete Telegram message
-	b.deleteMessage(ctx, account.ChatID, msg.TelegramMsgID)
+	if err := b.deleteMessage(ctx, account.ChatID, msg.TelegramMsgID); err != nil {
+		b.logger.Warn("failed to delete telegram message", "error", err)
+	}
 
 	b.answerCallback(ctx, callback.ID, "Письмо удалено", false)
 }
@@ -489,4 +438,33 @@ func (b *Bot) handleCopyCode(ctx context.Context, callback *models.CallbackQuery
 	code := codes[data.CodeIndex]
 	// Show alert with code (can be copied)
 	b.answerCallback(ctx, callback.ID, fmt.Sprintf("Код: %s", code.Value), true)
+}
+
+// statusMessage is a progress message that is edited instead of sending new ones
+type statusMessage struct {
+	ctx     context.Context
+	b       *Bot
+	chatID  int64
+	topicID int
+	msgID   int
+}
+
+func newStatusMessage(ctx context.Context, b *Bot, chatID int64, topicID int) *statusMessage {
+	return &statusMessage{ctx: ctx, b: b, chatID: chatID, topicID: topicID}
+}
+
+func (s *statusMessage) set(text string) {
+	if s.msgID != 0 {
+		if err := s.b.editMessageText(s.ctx, s.chatID, s.msgID, text); err == nil {
+			return
+		}
+	}
+	if sent, err := s.b.sendMessage(s.ctx, s.chatID, s.topicID, text); err == nil {
+		s.msgID = sent.ID
+	}
+}
+
+// escape escapes text for Telegram HTML parse mode
+func escape(s string) string {
+	return html.EscapeString(s)
 }

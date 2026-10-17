@@ -38,7 +38,7 @@ cp .env.example .env
 Edit `.env`:
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-ENCRYPTION_KEY=your-32-character-key!!
+ENCRYPTION_KEY=<output of make generate-key>
 ```
 
 Generate encryption key:
@@ -123,6 +123,8 @@ make docker-run
 | `LOG_LEVEL` | No | `info` | debug, info, warn, error |
 | `LOG_FORMAT` | No | `text` | text (colored) or json |
 | `IMAP_IDLE_TIMEOUT` | No | `25m` | IMAP IDLE timeout |
+| `IMAP_DIAL_TIMEOUT` | No | `30s` | IMAP connection timeout |
+| `EMAIL_POLL_INTERVAL` | No | `1m` | Max time between mailbox checks (polling interval if the server has no IDLE) |
 
 #### Mailcow Integration (Optional)
 
@@ -216,7 +218,7 @@ cp .env.example .env
 Отредактируйте `.env`:
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-ENCRYPTION_KEY=your-32-character-key!!
+ENCRYPTION_KEY=<output of make generate-key>
 ```
 
 Сгенерируйте ключ шифрования:
@@ -301,6 +303,8 @@ make docker-run
 | `LOG_LEVEL` | Нет | `info` | debug, info, warn, error |
 | `LOG_FORMAT` | Нет | `text` | text (цветной) или json |
 | `IMAP_IDLE_TIMEOUT` | Нет | `25m` | Таймаут IMAP IDLE |
+| `IMAP_DIAL_TIMEOUT` | Нет | `30s` | Таймаут подключения к IMAP |
+| `EMAIL_POLL_INTERVAL` | Нет | `1m` | Максимальный интервал между проверками ящика (интервал опроса, если сервер не поддерживает IDLE) |
 
 #### Интеграция Mailcow (опционально)
 

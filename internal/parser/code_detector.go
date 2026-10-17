@@ -2,10 +2,18 @@ package parser
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/mixelka/emailresend/pkg/models"
 )
+
+// maxCodes limits how many codes are shown for one email
+const maxCodes = 4
+
+// keywords that usually precede a verification code
+const codeKeywords = `code|код|otp|pin|пин|пароль|password|passcode|verification|верификац|подтвержд|confirm|активац|security|безопасност|2fa|одноразов`
 
 // CodeDetector detects verification codes in text
 type CodeDetector struct {
@@ -15,41 +23,42 @@ type CodeDetector struct {
 type codePattern struct {
 	Type  string
 	Regex *regexp.Regexp
+	// Valid filters out false positives; nil accepts everything
+	Valid func(code string) bool
 }
 
 // NewCodeDetector creates a new code detector
 func NewCodeDetector() *CodeDetector {
 	return &CodeDetector{
 		patterns: []*codePattern{
-			// OTP codes with keyword (4-8 digits)
+			// Numeric code after a keyword on the same line:
+			// "Код подтверждения: 123456", "Your verification code is 1234"
 			{
 				Type:  "otp",
-				Regex: regexp.MustCompile(`(?i)(?:code|код|otp|pin|пин|пароль|password)[\s:\-]*(\d{4,8})\b`),
+				Regex: regexp.MustCompile(`(?i)(?:` + codeKeywords + `)[^\n]{0,40}?(?:^|[^\d])(\d{4,8})\b`),
 			},
-			// Verification codes
+			// Split numeric code: "123 456", "123-456"
 			{
-				Type:  "verification",
-				Regex: regexp.MustCompile(`(?i)(?:verification|верификац|подтвержд|confirm|активац)[\s\w]*[\s:\-]*(\d{4,8})\b`),
+				Type:  "otp",
+				Regex: regexp.MustCompile(`(?i)(?:` + codeKeywords + `)[^\n]{0,40}?(?:^|[^\d])(\d{3}[ \-]\d{3})\b`),
 			},
-			// Standalone numeric codes (4-8 digits on their own line)
-			{
-				Type:  "code",
-				Regex: regexp.MustCompile(`(?m)^\s*(\d{4,8})\s*$`),
-			},
-			// Alphanumeric codes (like reset tokens)
+			// Standalone numeric code on its own line
 			{
 				Type:  "code",
-				Regex: regexp.MustCompile(`(?i)(?:code|код)[\s:\-]*([A-Z0-9]{4,12})\b`),
+				Regex: regexp.MustCompile(`(?m)^[^\S\n]*(\d{4,8})[^\S\n]*$`),
+				Valid: notYear,
 			},
-			// Security codes in specific format
+			// Alphanumeric code: "Code: AB12CD"
 			{
-				Type:  "security",
-				Regex: regexp.MustCompile(`(?i)(?:security|безопасност|2fa|two.factor)[\s\w]*[\s:\-]*(\d{4,8})\b`),
+				Type:  "code",
+				Regex: regexp.MustCompile(`(?i:code|код)[\s:\-]+([A-Z0-9]{4,12})\b`),
+				Valid: hasDigitAndLetter,
 			},
-			// Token/key patterns
+			// Token/key: "Token: abc123def456"
 			{
 				Type:  "token",
-				Regex: regexp.MustCompile(`(?i)(?:token|токен|key|ключ)[\s:\-]*([A-Za-z0-9\-_]{8,32})\b`),
+				Regex: regexp.MustCompile(`(?i:token|токен|key|ключ)[\s:\-]+([A-Za-z0-9\-_]{8,32})\b`),
+				Valid: hasDigitAndLetter,
 			},
 		},
 	}
@@ -63,20 +72,49 @@ func (d *CodeDetector) DetectCodes(text string) []models.DetectedCode {
 	for _, pattern := range d.patterns {
 		matches := pattern.Regex.FindAllStringSubmatch(text, -1)
 		for _, match := range matches {
-			if len(match) > 1 {
-				code := strings.TrimSpace(match[1])
-				// Skip if already seen or too short
-				if seen[code] || len(code) < 4 {
-					continue
-				}
-				seen[code] = true
-				codes = append(codes, models.DetectedCode{
-					Type:  pattern.Type,
-					Value: code,
-				})
+			if len(match) < 2 {
+				continue
+			}
+			code := normalizeCode(match[1])
+			if len(code) < 4 || seen[code] {
+				continue
+			}
+			if pattern.Valid != nil && !pattern.Valid(code) {
+				continue
+			}
+			seen[code] = true
+			codes = append(codes, models.DetectedCode{
+				Type:  pattern.Type,
+				Value: code,
+			})
+			if len(codes) >= maxCodes {
+				return codes
 			}
 		}
 	}
 
 	return codes
+}
+
+// normalizeCode removes separators from split numeric codes ("123 456" -> "123456")
+func normalizeCode(code string) string {
+	code = strings.TrimSpace(code)
+	stripped := strings.NewReplacer(" ", "", "-", "").Replace(code)
+	if _, err := strconv.Atoi(stripped); err == nil {
+		return stripped
+	}
+	return code
+}
+
+// notYear rejects 4-digit numbers that look like years (footers, dates)
+func notYear(code string) bool {
+	if len(code) != 4 {
+		return true
+	}
+	n, _ := strconv.Atoi(code)
+	return n < 1900 || n > 2099
+}
+
+func hasDigitAndLetter(code string) bool {
+	return strings.IndexFunc(code, unicode.IsDigit) >= 0 && strings.IndexFunc(code, unicode.IsLetter) >= 0
 }

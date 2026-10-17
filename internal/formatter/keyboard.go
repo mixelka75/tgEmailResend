@@ -2,7 +2,6 @@ package formatter
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/go-telegram/bot/models"
 
@@ -13,18 +12,13 @@ import (
 func BuildEmailKeyboard(msgID int64, codes []appmodels.DetectedCode, isRead bool) *models.InlineKeyboardMarkup {
 	var rows [][]models.InlineKeyboardButton
 
-	// Code buttons (copy on click)
+	// Code buttons: tapping copies the code to the clipboard
 	if len(codes) > 0 {
 		var codeButtons []models.InlineKeyboardButton
-		for i, code := range codes {
-			data := EncodeCallback(appmodels.CallbackData{
-				Action:    appmodels.CallbackCopyCode,
-				MessageID: msgID,
-				CodeIndex: i,
-			})
+		for _, code := range codes {
 			codeButtons = append(codeButtons, models.InlineKeyboardButton{
-				Text:         fmt.Sprintf("%s", code.Value),
-				CallbackData: data,
+				Text:     code.Value,
+				CopyText: &models.CopyTextButton{Text: code.Value},
 			})
 		}
 		// Split into rows of 2 buttons each

@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -39,20 +42,20 @@ type Mailbox struct {
 
 // CreateMailboxRequest request for creating a mailbox
 type CreateMailboxRequest struct {
-	LocalPart       string `json:"local_part"`
-	Domain          string `json:"domain"`
-	Name            string `json:"name"`
-	Password        string `json:"password"`
-	Password2       string `json:"password2"`
-	Quota           int    `json:"quota"`
-	Active          int    `json:"active"`
-	ForcePWUpdate   int    `json:"force_pw_update"`
-	TLSEnforceIn    int    `json:"tls_enforce_in"`
-	TLSEnforceOut   int    `json:"tls_enforce_out"`
-	SOGoAccess      int    `json:"sogo_access"`
-	IMAPAccess      int    `json:"imap_access"`
-	POPAccess       int    `json:"pop3_access"`
-	SMTPAccess      int    `json:"smtp_access"`
+	LocalPart     string `json:"local_part"`
+	Domain        string `json:"domain"`
+	Name          string `json:"name"`
+	Password      string `json:"password"`
+	Password2     string `json:"password2"`
+	Quota         int    `json:"quota"`
+	Active        int    `json:"active"`
+	ForcePWUpdate int    `json:"force_pw_update"`
+	TLSEnforceIn  int    `json:"tls_enforce_in"`
+	TLSEnforceOut int    `json:"tls_enforce_out"`
+	SOGoAccess    int    `json:"sogo_access"`
+	IMAPAccess    int    `json:"imap_access"`
+	POPAccess     int    `json:"pop3_access"`
+	SMTPAccess    int    `json:"smtp_access"`
 }
 
 // APIResponse generic API response
@@ -65,7 +68,7 @@ type APIResponse struct {
 // NewClient creates a new Mailcow API client
 func NewClient(cfg Config) *Client {
 	return &Client{
-		baseURL: cfg.BaseURL,
+		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		apiKey:  cfg.APIKey,
 		domain:  cfg.Domain,
 		httpClient: &http.Client{
@@ -105,20 +108,20 @@ func (c *Client) CreateMailbox(ctx context.Context, localPart, name, password st
 	}
 
 	req := CreateMailboxRequest{
-		LocalPart:       localPart,
-		Domain:          c.domain,
-		Name:            name,
-		Password:        password,
-		Password2:       password,
-		Quota:           quotaMB,
-		Active:          1,
-		ForcePWUpdate:   0,
-		TLSEnforceIn:    1,
-		TLSEnforceOut:   1,
-		SOGoAccess:      1,
-		IMAPAccess:      1,
-		POPAccess:       1,
-		SMTPAccess:      1,
+		LocalPart:     localPart,
+		Domain:        c.domain,
+		Name:          name,
+		Password:      password,
+		Password2:     password,
+		Quota:         quotaMB,
+		Active:        1,
+		ForcePWUpdate: 0,
+		TLSEnforceIn:  1,
+		TLSEnforceOut: 1,
+		SOGoAccess:    1,
+		IMAPAccess:    1,
+		POPAccess:     1,
+		SMTPAccess:    1,
 	}
 
 	body, err := json.Marshal(req)
@@ -250,19 +253,10 @@ func GenerateSecurePassword(length int) (string, error) {
 
 // GetIMAPServer returns the IMAP server for the Mailcow domain
 func (c *Client) GetIMAPServer() string {
-	// Extract host from baseURL
-	// e.g., https://mail.example.com -> mail.example.com:993
+	// e.g., https://mail.example.com/ -> mail.example.com:993
 	host := c.baseURL
-	if len(host) > 8 && host[:8] == "https://" {
-		host = host[8:]
-	} else if len(host) > 7 && host[:7] == "http://" {
-		host = host[7:]
+	if u, err := url.Parse(c.baseURL); err == nil && u.Hostname() != "" {
+		host = u.Hostname()
 	}
-
-	// Remove trailing slash
-	if host[len(host)-1] == '/' {
-		host = host[:len(host)-1]
-	}
-
-	return host + ":993"
+	return net.JoinHostPort(strings.Trim(host, "/"), "993")
 }

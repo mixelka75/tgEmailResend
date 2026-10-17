@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
+
 	"github.com/mixelka/emailresend/pkg/models"
 )
 
@@ -36,6 +38,10 @@ func (db *DB) CreateAccount(ctx context.Context, account *models.EmailAccount) e
 		now,
 	)
 	if err != nil {
+		var sqliteErr sqlite3.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique {
+			return ErrAlreadyExists
+		}
 		return fmt.Errorf("failed to create account: %w", err)
 	}
 

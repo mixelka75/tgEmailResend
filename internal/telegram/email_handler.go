@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mixelka/emailresend/internal/database"
 	"github.com/mixelka/emailresend/internal/email"
@@ -16,6 +17,8 @@ import (
 func (b *Bot) SetupEmailCallbacks() {
 	b.emailManager.SetMessageHandler(b.onNewEmail)
 	b.emailManager.SetErrorHandler(b.onEmailError)
+	b.emailManager.SetRecoverHandler(b.onEmailRecovered)
+	b.emailManager.SetLastUIDHandler(b.onLastUID)
 	b.emailManager.SetDecryptFunc(b.DecryptPasswordFunc())
 }
 
@@ -47,8 +50,13 @@ func (b *Bot) onNewEmail(accountID int64, rawEmail *email.RawEmail) {
 		}
 	}
 
-	// Detect codes
-	codes := b.codeDetector.DetectCodes(bodyText)
+	receivedAt := rawEmail.Date
+	if receivedAt.IsZero() {
+		receivedAt = time.Now()
+	}
+
+	// Detect codes (the subject often contains the code too)
+	codes := b.codeDetector.DetectCodes(rawEmail.Subject + "\n" + bodyText)
 	b.logger.Debug("detected codes", "count", len(codes), "codes", codes)
 
 	// Create message record
@@ -62,7 +70,7 @@ func (b *Bot) onNewEmail(accountID int64, rawEmail *email.RawEmail) {
 		Subject:       rawEmail.Subject,
 		BodyText:      bodyText,
 		BodyHTML:      rawEmail.BodyHTML,
-		ReceivedAt:    rawEmail.Date,
+		ReceivedAt:    receivedAt,
 		DetectedCodes: string(codesJSON),
 	}
 
@@ -119,7 +127,28 @@ func (b *Bot) onEmailError(accountID int64, err error) {
 	}
 
 	// Send error notification to topic
-	text := fmt.Sprintf("Ошибка подключения к почте <b>%s</b>:\n<code>%v</code>\n\nПопытка переподключения...",
-		account.Email, err)
+	text := fmt.Sprintf("Ошибка подключения к почте <b>%s</b>:\n<code>%s</code>\n\nБот продолжает попытки переподключения. Если сменился пароль — переподключите почту: /disconnect, затем /connect",
+		escape(account.Email), escape(err.Error()))
 	b.sendMessage(ctx, account.ChatID, account.TopicID, text)
+}
+
+// onEmailRecovered notifies that the connection works again
+func (b *Bot) onEmailRecovered(accountID int64) {
+	ctx := context.Background()
+
+	account, err := b.db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		b.logger.Error("failed to get account for recovery notification", "error", err)
+		return
+	}
+
+	b.sendMessage(ctx, account.ChatID, account.TopicID,
+		fmt.Sprintf("Подключение к почте <b>%s</b> восстановлено", escape(account.Email)))
+}
+
+// onLastUID persists the initial UID baseline of an account
+func (b *Bot) onLastUID(accountID int64, uid uint32) {
+	if err := b.db.UpdateAccountLastUID(context.Background(), accountID, uid); err != nil {
+		b.logger.Error("failed to update last uid", "error", err, "account_id", accountID)
+	}
 }

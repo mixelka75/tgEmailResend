@@ -2,6 +2,7 @@ package formatter
 
 import (
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/mixelka/emailresend/pkg/models"
@@ -32,7 +33,8 @@ func (f *TelegramFormatter) FormatEmail(msg *models.EmailMessage, codes []models
 	}
 
 	sb.WriteString(fmt.Sprintf("<b>От:</b> %s\n", from))
-	sb.WriteString(fmt.Sprintf("<b>Тема:</b> %s\n", f.escapeHTML(msg.Subject)))
+	subject, _ := f.truncate(msg.Subject, 300)
+	sb.WriteString(fmt.Sprintf("<b>Тема:</b> %s\n", f.escapeHTML(subject)))
 	sb.WriteString(fmt.Sprintf("<b>Дата:</b> %s\n", msg.ReceivedAt.Format("02.01.2006 15:04")))
 	sb.WriteString("\n")
 
@@ -40,15 +42,24 @@ func (f *TelegramFormatter) FormatEmail(msg *models.EmailMessage, codes []models
 	if len(codes) > 0 {
 		sb.WriteString("<b>Коды:</b>\n")
 		for _, code := range codes {
-			sb.WriteString(fmt.Sprintf("<code>%s</code> ", code.Value))
+			sb.WriteString(fmt.Sprintf("<code>%s</code> ", f.escapeHTML(code.Value)))
 		}
 		sb.WriteString("\n\n")
 	}
 
-	// Body
+	// Body. Telegram counts the limit in characters of the text after
+	// entities are parsed, so count runes of the unescaped text.
+	header := sb.String()
 	sb.WriteString("<b>Сообщение:</b>\n")
-	body := f.truncate(msg.BodyText, f.maxLength-sb.Len()-50)
+	headerRunes := len([]rune(stripTags(header))) + len("Сообщение:\n")
+	body, truncated := f.truncate(strings.TrimSpace(msg.BodyText), f.maxLength-headerRunes-50)
+	if body == "" {
+		body = "(пустое письмо)"
+	}
 	sb.WriteString(f.escapeHTML(body))
+	if truncated {
+		sb.WriteString("\n\n<i>... (сообщение обрезано)</i>")
+	}
 
 	return sb.String()
 }
@@ -62,13 +73,30 @@ func (f *TelegramFormatter) escapeHTML(s string) string {
 }
 
 // truncate truncates text to maxLen characters
-func (f *TelegramFormatter) truncate(s string, maxLen int) string {
+func (f *TelegramFormatter) truncate(s string, maxLen int) (string, bool) {
 	if maxLen <= 0 {
 		maxLen = 100
 	}
 	runes := []rune(s)
 	if len(runes) <= maxLen {
-		return s
+		return s, false
 	}
-	return string(runes[:maxLen]) + "\n\n<i>... (сообщение обрезано)</i>"
+	return string(runes[:maxLen]), true
+}
+
+// stripTags approximates the visible text of an HTML-formatted message
+func stripTags(s string) string {
+	var sb strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			sb.WriteRune(r)
+		}
+	}
+	return html.UnescapeString(sb.String())
 }
